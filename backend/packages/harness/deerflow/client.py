@@ -151,11 +151,15 @@ class DeerFlowClient:
                 explicit value for programmatic callers that do not want
                 env-var coupling.
         """
+        print("[DeerFlowClient] Initializing client")
+        
         if config_path is not None:
+            print(f"[DeerFlowClient] Loading custom config from: {config_path}")
             reload_app_config(config_path)
         self._app_config = get_app_config()
 
         if agent_name is not None and not AGENT_NAME_PATTERN.match(agent_name):
+            print(f"[DeerFlowClient] Invalid agent name: {agent_name} (pattern: {AGENT_NAME_PATTERN.pattern})")
             raise ValueError(f"Invalid agent name '{agent_name}'. Must match pattern: {AGENT_NAME_PATTERN.pattern}")
 
         self._checkpointer = checkpointer
@@ -172,6 +176,12 @@ class DeerFlowClient:
         self._agent = None
         self._agent_config_key: tuple | None = None
 
+        print(
+            f"[DeerFlowClient] Client initialized: agent_name={self._agent_name}, model={self._model_name}, "
+            f"thinking={self._thinking_enabled}, subagent={self._subagent_enabled}, "
+            f"plan_mode={self._plan_mode}, environment={self._environment}"
+        )
+
     def reset_agent(self) -> None:
         """Force the internal agent to be recreated on the next call.
 
@@ -179,8 +189,10 @@ class DeerFlowClient:
         installations) that should be reflected in the system prompt
         or tool set.
         """
+        print("[DeerFlowClient] Resetting agent instance")
         self._agent = None
         self._agent_config_key = None
+        print("[DeerFlowClient] Agent reset complete, will recreate on next invocation")
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -189,6 +201,7 @@ class DeerFlowClient:
     @staticmethod
     def _atomic_write_json(path: Path, data: dict) -> None:
         """Write JSON to *path* atomically (temp file + replace)."""
+        print(f"[DeerFlowClient] Atomic write to: {path}")
         fd = tempfile.NamedTemporaryFile(
             mode="w",
             dir=path.parent,
@@ -199,9 +212,11 @@ class DeerFlowClient:
             json.dump(data, fd, indent=2)
             fd.close()
             Path(fd.name).replace(path)
+            print(f"[DeerFlowClient] Atomic write completed successfully: {path}")
         except BaseException:
             fd.close()
             Path(fd.name).unlink(missing_ok=True)
+            print(f"[DeerFlowClient] Atomic write failed: {path}")
             raise
 
     def _get_runnable_config(self, thread_id: str, **overrides) -> RunnableConfig:
@@ -231,8 +246,10 @@ class DeerFlowClient:
         )
 
         if self._agent is not None and self._agent_config_key == key:
+            print("[DeerFlowClient] Reusing existing agent instance (config unchanged)")
             return
 
+        print("[DeerFlowClient] Creating new agent instance")
         thinking_enabled = cfg.get("thinking_enabled", True)
         model_name = cfg.get("model_name")
         subagent_enabled = cfg.get("subagent_enabled", False)
@@ -240,6 +257,16 @@ class DeerFlowClient:
 
         tools = self._get_tools(model_name=model_name, subagent_enabled=subagent_enabled)
         final_tools, deferred_setup = assemble_deferred_tools(tools, enabled=self._app_config.tool_search.enabled)
+
+        system_prompt = apply_prompt_template(
+                subagent_enabled=subagent_enabled,
+                max_concurrent_subagents=max_concurrent_subagents,
+                agent_name=self._agent_name,
+                available_skills=self._available_skills,
+                deferred_names=deferred_setup.deferred_names,
+            )
+        # print(f"system_prompt: {system_prompt}")
+
         kwargs: dict[str, Any] = {
             # attach_tracing=False because ``stream()`` injects tracing
             # callbacks at the graph invocation root so a single embedded run
@@ -256,13 +283,7 @@ class DeerFlowClient:
                 app_config=self._app_config,
                 deferred_setup=deferred_setup,
             ),
-            "system_prompt": apply_prompt_template(
-                subagent_enabled=subagent_enabled,
-                max_concurrent_subagents=max_concurrent_subagents,
-                agent_name=self._agent_name,
-                available_skills=self._available_skills,
-                deferred_names=deferred_setup.deferred_names,
-            ),
+            "system_prompt": system_prompt,
             "state_schema": ThreadState,
         }
         checkpointer = self._checkpointer
@@ -272,17 +293,24 @@ class DeerFlowClient:
             checkpointer = get_checkpointer()
         if checkpointer is not None:
             kwargs["checkpointer"] = checkpointer
+            print("[DeerFlowClient] Attached checkpointer to agent")
 
         self._agent = create_agent(**kwargs)
         self._agent_config_key = key
-        logger.info("Agent created: agent_name=%s, model=%s, thinking=%s", self._agent_name, model_name, thinking_enabled)
+        print(
+            f"[DeerFlowClient] Agent created successfully: agent_name={self._agent_name}, model={model_name}, "
+            f"thinking={thinking_enabled}, subagent={subagent_enabled}, "
+            f"tools_count={len(kwargs['tools'])}, middlewares_count={len(kwargs['middleware'])}"
+        )
 
     @staticmethod
     def _get_tools(*, model_name: str | None, subagent_enabled: bool):
         """Lazy import to avoid circular dependency at module level."""
         from deerflow.tools import get_available_tools
 
-        return get_available_tools(model_name=model_name, subagent_enabled=subagent_enabled)
+        tools = get_available_tools(model_name=model_name, subagent_enabled=subagent_enabled)
+        print(f"[DeerFlowClient] Loaded {len(tools)} available tools")
+        return tools
 
     @staticmethod
     def _serialize_tool_calls(tool_calls) -> list[dict]:
@@ -420,6 +448,7 @@ class DeerFlowClient:
             Dict with "thread_list" key containing list of thread info dicts,
             sorted by thread creation time descending.
         """
+        print(f"[DeerFlowClient] Listing recent threads (limit={limit})", )
         checkpointer = self._checkpointer
         if checkpointer is None:
             from deerflow.runtime.checkpointer.provider import get_checkpointer
@@ -464,7 +493,9 @@ class DeerFlowClient:
         threads = list(thread_info_map.values())
         threads.sort(key=lambda x: x.get("created_at") or "", reverse=True)
 
-        return {"thread_list": threads[:limit]}
+        result = {"thread_list": threads[:limit]}
+        print(f"[DeerFlowClient] Found {len(result['thread_list'])} threads")
+        return result
 
     def get_thread(self, thread_id: str) -> dict:
         """Get the complete thread record, including all node execution records.
@@ -475,6 +506,7 @@ class DeerFlowClient:
         Returns:
             Dict containing the thread's full checkpoint history.
         """
+        print(f"[DeerFlowClient] Retrieving thread: {thread_id}")
         checkpointer = self._checkpointer
         if checkpointer is None:
             from deerflow.runtime.checkpointer.provider import get_checkpointer
@@ -506,7 +538,9 @@ class DeerFlowClient:
         # Sort globally by timestamp to prevent partial ordering issues caused by different namespaces (e.g., subgraphs)
         checkpoints.sort(key=lambda x: x["ts"] if x["ts"] else "")
 
-        return {"thread_id": thread_id, "checkpoints": checkpoints}
+        result = {"thread_id": thread_id, "checkpoints": checkpoints}
+        print(f"[DeerFlowClient] Retrieved thread {thread_id} with {len(checkpoints)} checkpoints")
+        return result
 
     # ------------------------------------------------------------------
     # Public API — conversation
@@ -595,7 +629,10 @@ class DeerFlowClient:
         """
         if thread_id is None:
             thread_id = str(uuid.uuid4())
+            print(f"[DeerFlowClient] Auto-generated thread_id: {thread_id}")
 
+        print(f"[DeerFlowClient] Starting stream: thread_id={thread_id}, message_length={len(message)}")
+        
         config = self._get_runnable_config(thread_id, **kwargs)
 
         # Inject tracing callbacks and Langfuse trace metadata at the graph
@@ -608,6 +645,7 @@ class DeerFlowClient:
         if tracing_callbacks:
             existing_callbacks = list(config.get("callbacks") or [])
             config["callbacks"] = [*existing_callbacks, *tracing_callbacks]
+            print(f"[DeerFlowClient] Injected {len(tracing_callbacks)} tracing callbacks")
 
         configurable = config.get("configurable") or {}
         inject_langfuse_metadata(
@@ -678,6 +716,7 @@ class DeerFlowClient:
             sent.update(delta)
             return delta
 
+        event_count = 0
         for item in self._agent.stream(
             state,
             config=config,
@@ -691,6 +730,7 @@ class DeerFlowClient:
                 mode, chunk = "values", item
 
             if mode == "custom":
+                event_count += 1
                 yield StreamEvent(type="custom", data=chunk)
                 continue
 
@@ -713,6 +753,7 @@ class DeerFlowClient:
                         if msg_id:
                             streamed_ids.add(msg_id)
                         additional_kwargs_delta = _unsent_additional_kwargs(msg_id, additional_kwargs)
+                        event_count += 1
                         yield self._ai_text_event(
                             msg_id,
                             text,
@@ -725,6 +766,8 @@ class DeerFlowClient:
                         if msg_id:
                             streamed_ids.add(msg_id)
                         additional_kwargs_delta = None if sent_additional_kwargs else _unsent_additional_kwargs(msg_id, additional_kwargs)
+                        print(f"[DeerFlowClient] Agent calling tools: {[tc['name'] for tc in msg_chunk.tool_calls]}")
+                        event_count += 1
                         yield self._ai_tool_calls_event(
                             msg_id,
                             msg_chunk.tool_calls,
@@ -734,6 +777,8 @@ class DeerFlowClient:
                 elif isinstance(msg_chunk, ToolMessage):
                     if msg_id:
                         streamed_ids.add(msg_id)
+                    print(f"[DeerFlowClient] Received tool result: name={msg_chunk.name}, tool_call_id={msg_chunk.tool_call_id}")
+                    event_count += 1
                     yield self._tool_message_event(msg_chunk)
                 continue
 
@@ -759,6 +804,7 @@ class DeerFlowClient:
                             # dedicated attribution event, so clients should
                             # merge this empty-content AI event by message id
                             # and ignore it for text rendering.
+                            event_count += 1
                             yield self._ai_text_event(msg_id, "", None, additional_kwargs_delta)
                     continue
 
@@ -769,6 +815,9 @@ class DeerFlowClient:
 
                     if msg.tool_calls:
                         additional_kwargs_delta = _unsent_additional_kwargs(msg_id, additional_kwargs)
+                        tool_names = [tc["name"] for tc in msg.tool_calls] if msg.tool_calls else []
+                        print(f"[DeerFlowClient] Agent calling tools (values mode): {tool_names}")
+                        event_count += 1
                         yield self._ai_tool_calls_event(
                             msg_id,
                             msg.tool_calls,
@@ -779,6 +828,7 @@ class DeerFlowClient:
                     text = self._extract_text(msg.content)
                     if text:
                         additional_kwargs_delta = None if sent_additional_kwargs else _unsent_additional_kwargs(msg_id, additional_kwargs)
+                        event_count += 1
                         yield self._ai_text_event(
                             msg_id,
                             text,
@@ -790,12 +840,16 @@ class DeerFlowClient:
                         if not additional_kwargs_delta:
                             continue
                         # See the metadata-only follow-up convention above.
+                        event_count += 1
                         yield self._ai_text_event(msg_id, "", None, additional_kwargs_delta)
 
                 elif isinstance(msg, ToolMessage):
+                    print(f"[DeerFlowClient] Received tool result (values mode): name={msg.name}, tool_call_id={msg.tool_call_id}")
+                    event_count += 1
                     yield self._tool_message_event(msg)
 
             # Emit a values event for each state snapshot
+            event_count += 1
             yield StreamEvent(
                 type="values",
                 data={
@@ -805,7 +859,15 @@ class DeerFlowClient:
                 },
             )
 
+        event_count += 1
         yield StreamEvent(type="end", data={"usage": cumulative_usage})
+
+        print(
+            f"[DeerFlowClient] Stream completed: thread_id={thread_id}, events={event_count}, "
+            f"input_tokens={cumulative_usage['input_tokens']}, "
+            f"output_tokens={cumulative_usage['output_tokens']}, "
+            f"total_tokens={cumulative_usage['total_tokens']}"
+        )
 
     def chat(self, message: str, *, thread_id: str | None = None, **kwargs) -> str:
         """Send a message and return the final text response.
@@ -826,6 +888,12 @@ class DeerFlowClient:
             The accumulated text of the last AI message, or empty string
             if no AI text was produced.
         """
+        if thread_id is None:
+            thread_id = str(uuid.uuid4())
+            print(f"[DeerFlowClient] Auto-generated thread_id for chat: {thread_id}")
+
+        print(f"[DeerFlowClient] Starting chat: thread_id={thread_id}, message_length={len(message)}")
+        
         # Per-id delta lists joined once at the end — avoids the O(n²) cost
         # of repeated ``str + str`` on a growing buffer for long responses.
         chunks: dict[str, list[str]] = {}
@@ -837,7 +905,12 @@ class DeerFlowClient:
                 if delta:
                     chunks.setdefault(msg_id, []).append(delta)
                     last_id = msg_id
-        return "".join(chunks.get(last_id, ()))
+
+        response = "".join(chunks.get(last_id, ()))
+        print(
+            f"[DeerFlowClient] Chat completed: thread_id={thread_id}, response_length={len(response)}, messages_count={len(chunks)}"
+        )
+        return response
 
     # ------------------------------------------------------------------
     # Public API — configuration queries
@@ -850,24 +923,30 @@ class DeerFlowClient:
             Dict with "models" key containing list of model info dicts,
             matching the Gateway API ``ModelsListResponse`` schema.
         """
+        print("[DeerFlowClient] Listing available models")
         token_usage_enabled = getattr(getattr(self._app_config, "token_usage", None), "enabled", False)
         if not isinstance(token_usage_enabled, bool):
             token_usage_enabled = False
 
-        return {
-            "models": [
-                {
-                    "name": model.name,
-                    "model": getattr(model, "model", None),
-                    "display_name": getattr(model, "display_name", None),
-                    "description": getattr(model, "description", None),
-                    "supports_thinking": getattr(model, "supports_thinking", False),
-                    "supports_reasoning_effort": getattr(model, "supports_reasoning_effort", False),
-                }
-                for model in self._app_config.models
-            ],
+        models = [
+            {
+                "name": model.name,
+                "model": getattr(model, "model", None),
+                "display_name": getattr(model, "display_name", None),
+                "description": getattr(model, "description", None),
+                "supports_thinking": getattr(model, "supports_thinking", False),
+                "supports_reasoning_effort": getattr(model, "supports_reasoning_effort", False),
+            }
+            for model in self._app_config.models
+        ]
+
+        result = {
+            "models": models,
             "token_usage": {"enabled": token_usage_enabled},
         }
+
+        print(f"[DeerFlowClient] Found {len(models)} available models")
+        return result
 
     def list_skills(self, enabled_only: bool = False) -> dict:
         """List available skills.
@@ -879,18 +958,21 @@ class DeerFlowClient:
             Dict with "skills" key containing list of skill info dicts,
             matching the Gateway API ``SkillsListResponse`` schema.
         """
-        return {
-            "skills": [
-                {
-                    "name": s.name,
-                    "description": s.description,
-                    "license": s.license,
-                    "category": s.category,
-                    "enabled": s.enabled,
-                }
-                for s in get_or_new_skill_storage().load_skills(enabled_only=enabled_only)
-            ]
-        }
+        print(f"[DeerFlowClient] Listing skills (enabled_only={enabled_only})", )
+        skills = [
+            {
+                "name": s.name,
+                "description": s.description,
+                "license": s.license,
+                "category": s.category,
+                "enabled": s.enabled,
+            }
+            for s in get_or_new_skill_storage().load_skills(enabled_only=enabled_only)
+        ]
+
+        result = {"skills": skills}
+        print(f"[DeerFlowClient] Found {len(skills)} skills")
+        return result
 
     def get_memory(self) -> dict:
         """Get current memory data.
@@ -898,21 +980,30 @@ class DeerFlowClient:
         Returns:
             Memory data dict (see src/agents/memory/updater.py for structure).
         """
+        print("[DeerFlowClient] Retrieving memory data")
         from deerflow.agents.memory.updater import get_memory_data
 
-        return get_memory_data(user_id=get_effective_user_id())
+        memory_data = get_memory_data(user_id=get_effective_user_id())
+        print(f"[DeerFlowClient] Retrieved memory data with {len(memory_data.get('facts', []))} facts")
+        return memory_data
 
     def export_memory(self) -> dict:
         """Export current memory data for backup or transfer."""
+        print("[DeerFlowClient] Exporting memory data")
         from deerflow.agents.memory.updater import get_memory_data
 
-        return get_memory_data(user_id=get_effective_user_id())
+        memory_data = get_memory_data(user_id=get_effective_user_id())
+        print(f"[DeerFlowClient] Exported memory data: {len(memory_data.get('facts', []))} facts")
+        return memory_data
 
     def import_memory(self, memory_data: dict) -> dict:
         """Import and persist full memory data."""
+        print(f"[DeerFlowClient] Importing memory data: {len(memory_data.get('facts', []))} facts")
         from deerflow.agents.memory.updater import import_memory_data
 
-        return import_memory_data(memory_data, user_id=get_effective_user_id())
+        result = import_memory_data(memory_data, user_id=get_effective_user_id())
+        print("[DeerFlowClient] Memory import completed successfully")
+        return result
 
     def get_model(self, name: str) -> dict | None:
         """Get a specific model's configuration by name.
@@ -924,10 +1015,13 @@ class DeerFlowClient:
             Model info dict matching the Gateway API ``ModelResponse``
             schema, or None if not found.
         """
+        print(f"[DeerFlowClient] Retrieving model config: {name}")
         model = self._app_config.get_model_config(name)
         if model is None:
+            logger.warning("[DeerFlowClient] Model not found: %s", name)
             return None
-        return {
+
+        result = {
             "name": model.name,
             "model": getattr(model, "model", None),
             "display_name": getattr(model, "display_name", None),
@@ -935,6 +1029,9 @@ class DeerFlowClient:
             "supports_thinking": getattr(model, "supports_thinking", False),
             "supports_reasoning_effort": getattr(model, "supports_reasoning_effort", False),
         }
+
+        print(f"[DeerFlowClient] Retrieved model config: {name}")
+        return result
 
     # ------------------------------------------------------------------
     # Public API — MCP configuration
@@ -947,8 +1044,11 @@ class DeerFlowClient:
             Dict with "mcp_servers" key mapping server name to config,
             matching the Gateway API ``McpConfigResponse`` schema.
         """
+        print("[DeerFlowClient] Retrieving MCP configuration")
         config = get_extensions_config()
-        return {"mcp_servers": {name: server.model_dump() for name, server in config.mcp_servers.items()}}
+        result = {"mcp_servers": {name: server.model_dump() for name, server in config.mcp_servers.items()}}
+        print(f"[DeerFlowClient] Found {len(result['mcp_servers'])} MCP servers")
+        return result
 
     def update_mcp_config(self, mcp_servers: dict[str, dict]) -> dict:
         """Update MCP server configurations.
@@ -966,8 +1066,10 @@ class DeerFlowClient:
         Raises:
             OSError: If the config file cannot be written.
         """
+        print(f"[DeerFlowClient] Updating MCP configuration: {len(mcp_servers)} servers")
         config_path = ExtensionsConfig.resolve_config_path()
         if config_path is None:
+            print("[DeerFlowClient] Cannot locate extensions_config.json")
             raise FileNotFoundError("Cannot locate extensions_config.json. Set DEER_FLOW_EXTENSIONS_CONFIG_PATH or ensure it exists in the project root.")
 
         current_config = get_extensions_config()
@@ -982,7 +1084,10 @@ class DeerFlowClient:
         self._agent = None
         self._agent_config_key = None
         reloaded = reload_extensions_config()
-        return {"mcp_servers": {name: server.model_dump() for name, server in reloaded.mcp_servers.items()}}
+        
+        result = {"mcp_servers": {name: server.model_dump() for name, server in reloaded.mcp_servers.items()}}
+        print("[DeerFlowClient] MCP configuration updated successfully")
+        return result
 
     # ------------------------------------------------------------------
     # Public API — skills management
@@ -997,18 +1102,24 @@ class DeerFlowClient:
         Returns:
             Skill info dict, or None if not found.
         """
+        print(f"[DeerFlowClient] Retrieving skill: {name}")
         from deerflow.skills.storage import get_or_new_skill_storage
 
         skill = next((s for s in get_or_new_skill_storage().load_skills(enabled_only=False) if s.name == name), None)
         if skill is None:
+            logger.warning("[DeerFlowClient] Skill not found: %s", name)
             return None
-        return {
+
+        result = {
             "name": skill.name,
             "description": skill.description,
             "license": skill.license,
             "category": skill.category,
             "enabled": skill.enabled,
         }
+
+        print(f"[DeerFlowClient] Retrieved skill: {name} (enabled={skill.enabled})")
+        return result
 
     def update_skill(self, name: str, *, enabled: bool) -> dict:
         """Update a skill's enabled status.
@@ -1024,15 +1135,18 @@ class DeerFlowClient:
             ValueError: If the skill is not found.
             OSError: If the config file cannot be written.
         """
+        print(f"[DeerFlowClient] Updating skill: {name}, enabled={enabled}")
         from deerflow.skills.storage import get_or_new_skill_storage
 
         skills = get_or_new_skill_storage().load_skills(enabled_only=False)
         skill = next((s for s in skills if s.name == name), None)
         if skill is None:
+            print(f"[DeerFlowClient] Skill not found: {name}")
             raise ValueError(f"Skill '{name}' not found")
 
         config_path = ExtensionsConfig.resolve_config_path()
         if config_path is None:
+            print("[DeerFlowClient] Cannot locate extensions_config.json")
             raise FileNotFoundError("Cannot locate extensions_config.json. Set DEER_FLOW_EXTENSIONS_CONFIG_PATH or ensure it exists in the project root.")
 
         extensions_config = get_extensions_config()
@@ -1051,14 +1165,19 @@ class DeerFlowClient:
 
         updated = next((s for s in get_or_new_skill_storage().load_skills(enabled_only=False) if s.name == name), None)
         if updated is None:
+            print(f"[DeerFlowClient] Skill '{name}' disappeared after update")
             raise RuntimeError(f"Skill '{name}' disappeared after update")
-        return {
+
+        result = {
             "name": updated.name,
             "description": updated.description,
             "license": updated.license,
             "category": updated.category,
             "enabled": updated.enabled,
         }
+
+        print(f"[DeerFlowClient] Skill updated successfully: {name}, enabled={enabled}")
+        return result
 
     def install_skill(self, skill_path: str | Path) -> dict:
         """Install a skill from a .skill archive (ZIP).
@@ -1073,7 +1192,17 @@ class DeerFlowClient:
             FileNotFoundError: If the file does not exist.
             ValueError: If the file is invalid.
         """
-        return get_or_new_skill_storage().install_skill_from_archive(skill_path)
+        print(f"[DeerFlowClient] Installing skill from: {skill_path}")
+        result = get_or_new_skill_storage().install_skill_from_archive(skill_path)
+
+        if result.get("success"):
+            print(f"[DeerFlowClient] Skill installed successfully: {result.get('skill_name')}")
+            # Reset agent to pick up new skill
+            self.reset_agent()
+        else:
+            print(f"[DeerFlowClient] Skill installation failed: {result.get('message')}")
+
+        return result
 
     # ------------------------------------------------------------------
     # Public API — memory management
@@ -1085,27 +1214,39 @@ class DeerFlowClient:
         Returns:
             The reloaded memory data dict.
         """
+        print("[DeerFlowClient] Reloading memory data")
         from deerflow.agents.memory.updater import reload_memory_data
 
-        return reload_memory_data(user_id=get_effective_user_id())
+        memory_data = reload_memory_data(user_id=get_effective_user_id())
+        print(f"[DeerFlowClient] Memory reloaded: {len(memory_data.get('facts', []))} facts")
+        return memory_data
 
     def clear_memory(self) -> dict:
         """Clear all persisted memory data."""
+        logger.warning("[DeerFlowClient] Clearing all memory data")
         from deerflow.agents.memory.updater import clear_memory_data
 
-        return clear_memory_data(user_id=get_effective_user_id())
+        result = clear_memory_data(user_id=get_effective_user_id())
+        print("[DeerFlowClient] Memory cleared successfully")
+        return result
 
     def create_memory_fact(self, content: str, category: str = "context", confidence: float = 0.5) -> dict:
         """Create a single fact manually."""
+        print(f"[DeerFlowClient] Creating memory fact: category={category}, confidence={confidence:.2f}")
         from deerflow.agents.memory.updater import create_memory_fact
 
-        return create_memory_fact(content=content, category=category, confidence=confidence)
+        result = create_memory_fact(content=content, category=category, confidence=confidence)
+        print(f"[DeerFlowClient] Memory fact created: id={result.get('id')}")
+        return result
 
     def delete_memory_fact(self, fact_id: str) -> dict:
         """Delete a single fact from memory by fact id."""
+        print(f"[DeerFlowClient] Deleting memory fact: {fact_id}")
         from deerflow.agents.memory.updater import delete_memory_fact
 
-        return delete_memory_fact(fact_id)
+        result = delete_memory_fact(fact_id)
+        print(f"[DeerFlowClient] Memory fact deleted: {fact_id}")
+        return result
 
     def update_memory_fact(
         self,
@@ -1115,14 +1256,17 @@ class DeerFlowClient:
         confidence: float | None = None,
     ) -> dict:
         """Update a single fact manually, preserving omitted fields."""
+        print(f"[DeerFlowClient] Updating memory fact: {fact_id}")
         from deerflow.agents.memory.updater import update_memory_fact
 
-        return update_memory_fact(
+        result = update_memory_fact(
             fact_id=fact_id,
             content=content,
             category=category,
             confidence=confidence,
         )
+        print(f"[DeerFlowClient] Memory fact updated: {fact_id}")
+        return result
 
     def get_memory_config(self) -> dict:
         """Get memory system configuration.
@@ -1130,10 +1274,11 @@ class DeerFlowClient:
         Returns:
             Memory config dict.
         """
+        print("[DeerFlowClient] Retrieving memory configuration")
         from deerflow.config.memory_config import get_memory_config
 
         config = get_memory_config()
-        return {
+        result = {
             "enabled": config.enabled,
             "storage_path": config.storage_path,
             "debounce_seconds": config.debounce_seconds,
@@ -1145,6 +1290,9 @@ class DeerFlowClient:
             "guaranteed_categories": config.guaranteed_categories,
             "guaranteed_token_budget": config.guaranteed_token_budget,
         }
+        
+        print("[DeerFlowClient] Retrieved memory configuration")
+        return result
 
     def get_memory_status(self) -> dict:
         """Get memory status: config + current data.
@@ -1152,6 +1300,7 @@ class DeerFlowClient:
         Returns:
             Dict with "config" and "data" keys.
         """
+        print("[DeerFlowClient] Retrieving memory status")
         return {
             "config": self.get_memory_config(),
             "data": self.get_memory(),
@@ -1178,6 +1327,7 @@ class DeerFlowClient:
             FileNotFoundError: If any file does not exist.
             ValueError: If any supplied path exists but is not a regular file.
         """
+        print(f"[DeerFlowClient] Uploading files: thread_id={thread_id}, files_count={len(files)}")
         from deerflow.utils.file_conversion import CONVERTIBLE_EXTENSIONS, convert_file_to_markdown
 
         # Validate all files upfront to avoid partial uploads.
@@ -1187,8 +1337,10 @@ class DeerFlowClient:
         for f in files:
             p = Path(f)
             if not p.exists():
+                print(f"[DeerFlowClient] File not found: {f}")
                 raise FileNotFoundError(f"File not found: {f}")
             if not p.is_file():
+                print(f"[DeerFlowClient] Path is not a file: {f}")
                 raise ValueError(f"Path is not a file: {f}")
             dest_name = claim_unique_filename(p.name, seen_names)
             resolved_files.append((p, dest_name))
@@ -1237,7 +1389,7 @@ class DeerFlowClient:
                             md_path = asyncio.run(convert_file_to_markdown(dest))
                     except Exception:
                         logger.warning(
-                            "Failed to convert %s to markdown",
+                            "[DeerFlowClient] Failed to convert %s to markdown",
                             src_path.name,
                             exc_info=True,
                         )
@@ -1254,6 +1406,7 @@ class DeerFlowClient:
             if conversion_pool is not None:
                 conversion_pool.shutdown(wait=True)
 
+        print(f"[DeerFlowClient] Files uploaded successfully: thread_id={thread_id}, uploaded={len(uploaded_files)}")
         return {
             "success": True,
             "files": uploaded_files,
@@ -1270,9 +1423,12 @@ class DeerFlowClient:
             Dict with "files" and "count" keys, matching the Gateway API
             ``list_uploaded_files`` response.
         """
+        print(f"[DeerFlowClient] Listing uploads: thread_id={thread_id}")
         uploads_dir = get_uploads_dir(thread_id)
         result = list_files_in_dir(uploads_dir)
-        return enrich_file_listing(result, thread_id)
+        enriched = enrich_file_listing(result, thread_id)
+        print(f"[DeerFlowClient] Found {enriched['count']} uploads")
+        return enriched
 
     def delete_upload(self, thread_id: str, filename: str) -> dict:
         """Delete a file from a thread's uploads directory.
@@ -1289,10 +1445,13 @@ class DeerFlowClient:
             FileNotFoundError: If the file does not exist.
             PermissionError: If path traversal is detected.
         """
+        print(f"[DeerFlowClient] Deleting upload: thread_id={thread_id}, filename={filename}")
         from deerflow.utils.file_conversion import CONVERTIBLE_EXTENSIONS
 
         uploads_dir = get_uploads_dir(thread_id)
-        return delete_file_safe(uploads_dir, filename, convertible_extensions=CONVERTIBLE_EXTENSIONS)
+        result = delete_file_safe(uploads_dir, filename, convertible_extensions=CONVERTIBLE_EXTENSIONS)
+        print(f"[DeerFlowClient] Upload deleted: thread_id={thread_id}, filename={filename}")
+        return result
 
     # ------------------------------------------------------------------
     # Public API — artifacts
@@ -1312,6 +1471,7 @@ class DeerFlowClient:
             FileNotFoundError: If the artifact does not exist.
             ValueError: If the path is invalid.
         """
+        print(f"[DeerFlowClient] Retrieving artifact: thread_id={thread_id}, path={path}")
         try:
             actual = get_paths().resolve_virtual_path(thread_id, path, user_id=get_effective_user_id())
         except ValueError as exc:
@@ -1321,9 +1481,12 @@ class DeerFlowClient:
                 raise PathTraversalError("Path traversal detected") from exc
             raise
         if not actual.exists():
+            print(f"[DeerFlowClient] Artifact not found: {path}")
             raise FileNotFoundError(f"Artifact not found: {path}")
         if not actual.is_file():
+            print(f"[DeerFlowClient] Path is not a file: {path}")
             raise ValueError(f"Path is not a file: {path}")
 
         mime_type, _ = mimetypes.guess_type(actual)
+        print(f"[DeerFlowClient] Retrieved artifact: {path}, size={actual.stat().st_size} bytes")
         return actual.read_bytes(), mime_type or "application/octet-stream"
