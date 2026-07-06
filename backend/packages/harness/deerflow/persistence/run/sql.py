@@ -8,14 +8,15 @@ minutes -- we don't hold connections across long execution.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from deerflow.persistence.run.model import RunRow
-from deerflow.runtime.runs.store.base import RunStore
+from deerflow.runtime.runs.store.base import ActiveRunConflict, RunStore
 from deerflow.runtime.user_context import AUTO, _AutoSentinel, resolve_user_id
 from deerflow.utils.time import coerce_iso
 
@@ -72,7 +73,7 @@ class RunRepository(RunStore):
         # Convert datetime to ISO string for consistency with MemoryRunStore.
         # SQLite drops tzinfo on read despite ``DateTime(timezone=True)`` —
         # ``coerce_iso`` normalizes naive datetimes as UTC.
-        for key in ("created_at", "updated_at"):
+        for key in ("created_at", "updated_at", "lease_expires_at"):
             val = d.get(key)
             if isinstance(val, datetime):
                 d[key] = coerce_iso(val)
@@ -93,6 +94,8 @@ class RunRepository(RunStore):
         error=None,
         created_at=None,
         follow_up_to_run_id=None,
+        owner_worker_id: str | None = None,
+        lease_expires_at: datetime | None = None,
     ):
         """Insert or update a run row.
 
@@ -114,6 +117,8 @@ class RunRepository(RunStore):
             "kwargs_json": self._safe_json(kwargs) or {},
             "error": error,
             "follow_up_to_run_id": follow_up_to_run_id,
+            "owner_worker_id": owner_worker_id,
+            "lease_expires_at": lease_expires_at,
             "updated_at": now,
         }
         async with self._sf() as session:
@@ -376,3 +381,154 @@ class RunRepository(RunStore):
                 "middleware": middleware,
             },
         }
+
+    # ------------------------------------------------------------------
+    # Lease-based atomic primitives (multi-worker only)
+    # ------------------------------------------------------------------
+
+    @property
+    def supports_lease_takeover(self) -> bool:
+        return True
+
+    async def insert_active_run_atomic(
+        self,
+        run_id: str,
+        *,
+        thread_id: str,
+        assistant_id: str | None,
+        user_id: str | None,
+        model_name: str | None,
+        multitask_strategy: str,
+        metadata: dict[str, Any] | None,
+        kwargs: dict[str, Any] | None,
+        created_at: datetime,
+        owner_worker_id: str,
+        lease_expires_at: datetime,
+    ) -> None:
+        """Atomically INSERT a new active run relying on the partial unique index.
+
+        Raises :class:`ActiveRunConflict` when ``uq_runs_thread_active`` rejects
+        the INSERT. The row is written with ``status='pending'`` so it lands in
+        the partial-index predicate; ``RunManager`` flips it to ``running``
+        once the agent graph starts.
+        """
+        row = RunRow(
+            run_id=run_id,
+            thread_id=thread_id,
+            assistant_id=assistant_id,
+            user_id=user_id,
+            model_name=self._normalize_model_name(model_name),
+            status="pending",
+            multitask_strategy=multitask_strategy,
+            metadata_json=self._safe_json(metadata) or {},
+            kwargs_json=self._safe_json(kwargs) or {},
+            created_at=created_at,
+            updated_at=datetime.now(UTC),
+            owner_worker_id=owner_worker_id,
+            lease_expires_at=lease_expires_at,
+        )
+        async with self._sf() as session:
+            session.add(row)
+            try:
+                await session.commit()
+            except IntegrityError as exc:
+                await session.rollback()
+                raise ActiveRunConflict(thread_id) from exc
+
+    async def claim_inflight_for_thread(
+        self,
+        thread_id: str,
+        *,
+        now: datetime,
+        grace_seconds: int,
+    ) -> list[dict[str, Any]]:
+        """Return inflight rows for *thread_id* with their lease liveness flag.
+
+        Locks the rows ``FOR UPDATE`` so callers can act on the snapshot without
+        racing a heartbeat write or a peer worker's takeover. ``lease_live`` is
+        ``True`` when ``lease_expires_at`` is at least ``now - grace_seconds``
+        (NULL leases count as not live — they pre-date the lease column).
+        """
+        cutoff = now - timedelta(seconds=grace_seconds)
+        stmt = (
+            select(RunRow)
+            .where(
+                RunRow.thread_id == thread_id,
+                RunRow.status.in_(("pending", "running")),
+            )
+            .with_for_update()
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            rows = list(result.scalars())
+            payload: list[dict[str, Any]] = []
+            for row in rows:
+                dto = self._row_to_dict(row)
+                lease_at = row.lease_expires_at
+                dto["lease_live"] = lease_at is not None and lease_at >= cutoff
+                payload.append(dto)
+            await session.commit()
+            return payload
+
+    async def renew_lease(
+        self,
+        run_id: str,
+        *,
+        owner_worker_id: str,
+        lease_expires_at: datetime,
+    ) -> bool:
+        """Refresh ``lease_expires_at`` on a run this worker still owns."""
+        stmt = (
+            update(RunRow)
+            .where(
+                RunRow.run_id == run_id,
+                RunRow.owner_worker_id == owner_worker_id,
+                RunRow.status.in_(("pending", "running")),
+            )
+            .values(lease_expires_at=lease_expires_at, updated_at=datetime.now(UTC))
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount != 0
+
+    async def takeover_expired_active_run(
+        self,
+        run_id: str,
+        *,
+        caller_worker_id: str,
+        error: str,
+        new_status: str,
+        lease_cutoff: datetime,
+    ) -> bool:
+        """Mark an orphaned active run terminal so this worker can act on it.
+
+        Only succeeds when the row is still ``pending``/``running`` AND either
+        has no lease yet or the lease has expired past *lease_cutoff*. The
+        ``owner_worker_id`` guard is intentionally absent — the caller is by
+        construction a different worker (the active owner has no in-memory
+        record on this worker, otherwise ``cancel`` would not be here) and the
+        lease cutoff already encodes "the owner is presumed dead".
+        """
+        stmt = (
+            update(RunRow)
+            .where(
+                RunRow.run_id == run_id,
+                RunRow.status.in_(("pending", "running")),
+                or_(
+                    RunRow.lease_expires_at.is_(None),
+                    RunRow.lease_expires_at < lease_cutoff,
+                ),
+            )
+            .values(
+                status=new_status,
+                error=error,
+                lease_expires_at=None,
+                owner_worker_id=None,
+                updated_at=datetime.now(UTC),
+            )
+        )
+        async with self._sf() as session:
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount != 0

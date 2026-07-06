@@ -24,6 +24,7 @@ from deerflow.config.model_config import ModelConfig
 from deerflow.config.read_before_write_config import ReadBeforeWriteConfig
 from deerflow.config.reload_boundary import format_field_description
 from deerflow.config.run_events_config import RunEventsConfig
+from deerflow.config.run_ownership_config import RunOwnershipConfig
 from deerflow.config.runtime_paths import existing_project_file
 from deerflow.config.safety_finish_reason_config import SafetyFinishReasonConfig
 from deerflow.config.sandbox_config import SandboxConfig
@@ -197,6 +198,13 @@ class AppConfig(BaseModel):
         description=format_field_description(
             "scheduler",
             field_doc="Scheduled task runtime configuration (background poller for one-time and cron agent runs).",
+        ),
+    )
+    run_ownership: RunOwnershipConfig = Field(
+        default_factory=RunOwnershipConfig,
+        description=format_field_description(
+            "run_ownership",
+            field_doc="Multi-worker run ownership / lease configuration. Leave heartbeat_enabled=False for single-worker deployments; flip it on for GATEWAY_WORKERS>1.",
         ),
     )
     checkpointer: CheckpointerConfig | None = Field(

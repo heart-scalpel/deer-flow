@@ -44,7 +44,27 @@ class RunRow(Base):
     # Follow-up association
     follow_up_to_run_id: Mapped[str | None] = mapped_column(String(64))
 
+    # Multi-worker run ownership (issue: multi-worker P0). ``owner_worker_id``
+    # identifies the worker that inserted / owns the active run; ``lease_expires_at``
+    # is renewed by the heartbeat task and read by the reconciliation step to
+    # recover runs whose owner crashed. The partial unique index
+    # ``uq_runs_thread_active`` lives in ``0004_run_ownership`` and enforces
+    # "one active run per thread" at the DB level — keep it in sync with the
+    # ``pending``/``running`` literals used by ``RunStatus``.
+    owner_worker_id: Mapped[str | None] = mapped_column(String(128))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
 
-    __table_args__ = (Index("ix_runs_thread_status", "thread_id", "status"),)
+    __table_args__ = (
+        Index("ix_runs_thread_status", "thread_id", "status"),
+        Index("ix_runs_lease", "lease_expires_at"),
+        Index(
+            "uq_runs_thread_active",
+            "thread_id",
+            unique=True,
+            sqlite_where=text("status IN ('pending', 'running')"),
+            postgresql_where=text("status IN ('pending', 'running')"),
+        ),
+    )

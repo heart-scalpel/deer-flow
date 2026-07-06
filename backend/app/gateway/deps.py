@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import socket
+import uuid
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from typing import TYPE_CHECKING, TypeVar, cast
@@ -44,6 +46,19 @@ logger = logging.getLogger(__name__)
 # them together if their sum must stay within the server's graceful-shutdown
 # timeout.
 _RUN_DRAIN_TIMEOUT_SECONDS = 5.0
+
+
+def _generate_worker_id() -> str:
+    """Return a stable per-process worker identifier.
+
+    Format mirrors :class:`ScheduledTaskService._lease_owner`
+    (``hostname:uuid``) so logs and store rows surface the same shape across
+    the run path and the scheduler. Truncated to 128 chars to fit
+    ``runs.owner_worker_id``.
+    """
+    hostname = socket.gethostname() or "unknown"
+    raw = f"{hostname}:{uuid.uuid4().hex}"
+    return raw[:128]
 
 
 def _enforce_postgres_for_multi_worker(config: AppConfig) -> None:
@@ -286,31 +301,56 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
         app.state.run_events_config = run_events_config
         app.state.run_event_store = make_run_event_store(run_events_config)
 
-        # RunManager with store backing for persistence
-        app.state.run_manager = RunManager(store=app.state.run_store)
-        if getattr(config.database, "backend", None) == "sqlite":
-            from deerflow.utils.time import now_iso
+        # RunManager with store backing for persistence. ``worker_id`` and the
+        # ownership snapshot are captured once here so the run path can decide
+        # between the legacy single-worker code path and the lease-aware path
+        # without re-reading config (the heartbeat task is what makes the
+        # lease-aware path safe, and restarting it on every config.yaml edit
+        # would churn the background task graph for no benefit).
+        worker_id = _generate_worker_id()
+        ownership_config = getattr(config, "run_ownership", None)
+        app.state.run_manager = RunManager(
+            store=app.state.run_store,
+            worker_id=worker_id,
+            ownership_config=ownership_config,
+        )
 
-            # Startup-only recovery: clean shutdowns return no active rows and
-            # the thread-status update below becomes a no-op.
-            recovered_runs = await app.state.run_manager.reconcile_orphaned_inflight_runs(
-                error="Gateway restarted before this run reached a durable final state.",
-                before=now_iso(),
-            )
-            sb_config = getattr(config, "stream_bridge", None)
-            cleanup_delay = getattr(sb_config, "recovered_stream_cleanup_delay_seconds", 60.0) if sb_config else 60.0
-            await _publish_recovered_run_stream_end(app.state.stream_bridge, recovered_runs, cleanup_delay=cleanup_delay)
-            await _mark_latest_recovered_threads_error(app.state.run_manager, app.state.thread_store, recovered_runs)
+        # Startup-only recovery: clean shutdowns return no active rows and
+        # the thread-status update below becomes a no-op. Runs on every
+        # backend now — multi-worker Postgres relies on the lease check
+        # inside ``reconcile_orphaned_inflight_runs`` (live leases owned by
+        # other workers are skipped), and SQLite / single-worker Postgres
+        # always recover because no local task can still own them.
+        from deerflow.utils.time import now_iso
+
+        recovered_runs = await app.state.run_manager.reconcile_orphaned_inflight_runs(
+            error="Gateway restarted before this run reached a durable final state.",
+            before=now_iso(),
+        )
+        sb_config = getattr(config, "stream_bridge", None)
+        cleanup_delay = getattr(sb_config, "recovered_stream_cleanup_delay_seconds", 60.0) if sb_config else 60.0
+        await _publish_recovered_run_stream_end(app.state.stream_bridge, recovered_runs, cleanup_delay=cleanup_delay)
+        await _mark_latest_recovered_threads_error(app.state.run_manager, app.state.thread_store, recovered_runs)
+
+        # Heartbeat must start AFTER reconciliation so it only renews leases
+        # for runs this worker actually owns going forward.
+        await app.state.run_manager.start_heartbeat()
 
         try:
             yield
         finally:
+            # Stop the heartbeat before draining in-flight runs so the two do
+            # not race: a heartbeat tick mid-drain would renew a lease for a
+            # run whose task we are about to cancel, briefly tricking another
+            # worker into thinking the run is still alive here.
+            run_manager = getattr(app.state, "run_manager", None)
+            if run_manager is not None:
+                await run_manager.stop_heartbeat()
             # Drain in-flight run tasks BEFORE the AsyncExitStack tears down the
             # checkpointer (and its connection pool). A run still mid-graph would
             # otherwise leak into asyncio.run() shutdown, where langgraph's
             # _checkpointer_put_after_previous aput races the closed pool and
             # raises PoolClosed (issue #3373).
-            run_manager = getattr(app.state, "run_manager", None)
             if run_manager is not None:
                 await _drain_inflight_runs(run_manager)
             await close_engine()

@@ -46,6 +46,8 @@ class MemoryRunStore(RunStore):
         kwargs=None,
         error=None,
         created_at=None,
+        owner_worker_id=None,
+        lease_expires_at=None,
     ):
         now = datetime.now(UTC).isoformat()
         self._runs[run_id] = {
@@ -61,6 +63,8 @@ class MemoryRunStore(RunStore):
             "error": error,
             "created_at": created_at or now,
             "updated_at": now,
+            "owner_worker_id": owner_worker_id,
+            "lease_expires_at": lease_expires_at,
         }
         self._index_run(run_id, thread_id)
 

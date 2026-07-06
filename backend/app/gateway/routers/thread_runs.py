@@ -512,14 +512,29 @@ async def cancel_run(
     - action=rollback: Stop execution, revert to pre-run checkpoint state
     - wait=true: Block until the run fully stops, return 204
     - wait=false: Return immediately with 202
+
+    Multi-worker note: when the run is owned by another worker whose lease is
+    still live, the response is ``409`` with a ``Retry-After`` header carrying
+    the remaining lease window (seconds). When the owning worker's lease has
+    expired, this worker takes over: it marks the run ``error`` so the partial
+    unique index releases the thread, then returns ``202`` (the caller may
+    retry the create / cancel sequence immediately).
     """
     run_mgr = get_run_manager(request)
     record = await run_mgr.get(run_id)
     if record is None or record.thread_id != thread_id:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
 
-    cancelled = await run_mgr.cancel(run_id, action=action)
-    if not cancelled:
+    outcome = await run_mgr.cancel(run_id, action=action)
+    if outcome.owner_live_elsewhere:
+        retry_after = outcome.retry_after_seconds or 0.0
+        headers = {"Retry-After": str(max(1, int(retry_after) or 1))}
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run {run_id} is owned by another worker; retry after {int(retry_after)}s",
+            headers=headers,
+        )
+    if not outcome.initiated:
         raise HTTPException(status_code=409, detail=_cancel_conflict_detail(run_id, record))
 
     if wait and record.task is not None:
@@ -586,8 +601,16 @@ async def stream_existing_run(
 
     # Cancel if an action was requested (stop-button / interrupt flow)
     if action is not None:
-        cancelled = await run_mgr.cancel(run_id, action=action)
-        if not cancelled:
+        outcome = await run_mgr.cancel(run_id, action=action)
+        if outcome.owner_live_elsewhere:
+            retry_after = outcome.retry_after_seconds or 0.0
+            headers = {"Retry-After": str(max(1, int(retry_after) or 1))}
+            raise HTTPException(
+                status_code=409,
+                detail=f"Run {run_id} is owned by another worker; retry after {int(retry_after)}s",
+                headers=headers,
+            )
+        if not outcome.initiated:
             raise HTTPException(status_code=409, detail=_cancel_conflict_detail(run_id, record))
         if wait and record.task is not None:
             try:

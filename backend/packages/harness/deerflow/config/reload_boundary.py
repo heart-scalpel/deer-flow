@@ -68,6 +68,10 @@ STARTUP_ONLY_FIELDS: dict[str, str] = {
         "ScheduledTaskService is constructed and started once during Gateway lifespan startup; enabled, poll_interval_seconds, lease_seconds, "
         "and max_concurrent_runs are captured into the service instance and the background poller task is not rebuilt on config.yaml edits."
     ),
+    "run_ownership": (
+        "RunManager is constructed once during langgraph_runtime() startup with worker_id / lease_seconds / grace_seconds / heartbeat_enabled captured "
+        "from config.run_ownership, and the per-worker heartbeat task is started (or not) at the same time. None of these are re-evaluated on config.yaml edits."
+    ),
 }
 
 
