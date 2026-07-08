@@ -5,9 +5,10 @@ Equivalent to the original RunManager._runs dict behavior.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from deerflow.runtime.runs.manager import ConflictError
 from deerflow.runtime.runs.store.base import RunStore
 
 
@@ -46,6 +47,8 @@ class MemoryRunStore(RunStore):
         kwargs=None,
         error=None,
         created_at=None,
+        owner_worker_id=None,
+        lease_expires_at=None,
     ):
         now = datetime.now(UTC).isoformat()
         self._runs[run_id] = {
@@ -61,6 +64,8 @@ class MemoryRunStore(RunStore):
             "error": error,
             "created_at": created_at or now,
             "updated_at": now,
+            "owner_worker_id": owner_worker_id,
+            "lease_expires_at": lease_expires_at,
         }
         self._index_run(run_id, thread_id)
 
@@ -146,10 +151,6 @@ class MemoryRunStore(RunStore):
                     entry["tokens"] += usage.get("total_tokens", 0)
                     entry["runs"] += 1
             else:
-                # Fallback for rows written before per-model accounting landed:
-                # attribute the whole run to its single ``model_name``. Keeps
-                # the legacy lead-only behavior for old data instead of
-                # silently dropping it.
                 model = r.get("model_name") or "unknown"
                 entry = by_model.setdefault(model, {"tokens": 0, "runs": 0})
                 entry["tokens"] += r.get("total_tokens", 0)
@@ -166,3 +167,156 @@ class MemoryRunStore(RunStore):
                 "middleware": sum(r.get("middleware_tokens", 0) for r in completed),
             },
         }
+
+    # ------------------------------------------------------------------
+    # Multi-worker run ownership methods
+    # ------------------------------------------------------------------
+
+    async def update_lease(
+        self,
+        run_id: str,
+        *,
+        owner_worker_id: str,
+        lease_expires_at: str,
+    ) -> bool:
+        run = self._runs.get(run_id)
+        if run is None:
+            return False
+        if run["status"] not in ("pending", "running"):
+            return False
+        run["owner_worker_id"] = owner_worker_id
+        run["lease_expires_at"] = lease_expires_at
+        run["updated_at"] = datetime.now(UTC).isoformat()
+        return True
+
+    async def list_inflight_with_expired_lease(
+        self,
+        *,
+        before: str | None = None,
+        grace_seconds: int = 10,
+    ) -> list[dict[str, Any]]:
+        now = before or datetime.now(UTC).isoformat()
+        cutoff = datetime.now(UTC) - timedelta(seconds=grace_seconds)
+        results = []
+        for r in self._runs.values():
+            if r["status"] not in ("pending", "running"):
+                continue
+            if r.get("created_at", "") > now:
+                continue
+            lease = r.get("lease_expires_at")
+            if lease is None:
+                # Pre-ownership rows: no lease means orphaned
+                results.append(r)
+            else:
+                try:
+                    lease_dt = datetime.fromisoformat(lease)
+                    if lease_dt < cutoff:
+                        results.append(r)
+                except (ValueError, TypeError):
+                    results.append(r)
+        results.sort(key=lambda r: r["created_at"])
+        return results
+
+    async def claim_inflight_runs(
+        self,
+        thread_id: str,
+        *,
+        owner_worker_id: str,
+        lease_expires_at: str,
+        now_iso: str,
+        grace_seconds: int,
+    ) -> list[dict[str, Any]]:
+        cutoff = datetime.now(UTC) - timedelta(seconds=grace_seconds)
+        claimed = []
+        for r in self._runs.values():
+            if r["thread_id"] != thread_id:
+                continue
+            if r["status"] not in ("pending", "running"):
+                continue
+            existing_lease = r.get("lease_expires_at")
+            if existing_lease is not None:
+                try:
+                    lease_dt = datetime.fromisoformat(existing_lease)
+                    if lease_dt >= cutoff and r.get("owner_worker_id") != owner_worker_id:
+                        # Lease still valid and owned by another live worker
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            # Claim: mark as interrupted
+            r["status"] = "interrupted"
+            r["error"] = "Cancelled by newer run"
+            r["owner_worker_id"] = owner_worker_id
+            r["updated_at"] = datetime.now(UTC).isoformat()
+            claimed.append(r)
+        return claimed
+
+    async def create_run_atomic(
+        self,
+        run_id: str,
+        *,
+        thread_id: str,
+        owner_worker_id: str,
+        lease_expires_at: str | None,
+        multitask_strategy: str = "reject",
+        assistant_id: str | None = None,
+        user_id: str | None = None,
+        model_name: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        kwargs: dict[str, Any] | None = None,
+        created_at: str | None = None,
+        grace_seconds: int = 10,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        now = datetime.now(UTC).isoformat()
+        cutoff = datetime.now(UTC) - timedelta(seconds=grace_seconds)
+
+        # For reject: check if any active run exists
+        if multitask_strategy == "reject":
+            for r in self._runs.values():
+                if r["thread_id"] == thread_id and r["status"] in ("pending", "running"):
+                    raise ConflictError(f"Thread {thread_id} already has an active run")
+
+        # For interrupt/rollback: claim inflight runs
+        claimed = []
+        if multitask_strategy in ("interrupt", "rollback"):
+            for r in self._runs.values():
+                if r["thread_id"] != thread_id:
+                    continue
+                if r["status"] not in ("pending", "running"):
+                    continue
+                existing_lease = r.get("lease_expires_at")
+                if existing_lease is not None:
+                    try:
+                        lease_dt = datetime.fromisoformat(existing_lease)
+                        if lease_dt >= cutoff and r.get("owner_worker_id") != owner_worker_id:
+                            # Live run owned by another worker — cannot
+                            # interrupt, and the partial unique index would
+                            # reject the INSERT anyway. Surface as ConflictError
+                            # so the caller gets a clean signal.
+                            raise ConflictError(f"Thread {thread_id} already has an active run owned by another worker")
+                    except (ValueError, TypeError):
+                        pass
+                r["status"] = "interrupted"
+                r["error"] = "Cancelled by newer run"
+                r["owner_worker_id"] = owner_worker_id
+                r["updated_at"] = now
+                claimed.append(r)
+
+        new_row = {
+            "run_id": run_id,
+            "thread_id": thread_id,
+            "assistant_id": assistant_id,
+            "user_id": user_id,
+            "model_name": model_name,
+            "status": "pending",
+            "multitask_strategy": multitask_strategy,
+            "metadata": metadata or {},
+            "kwargs": kwargs or {},
+            "error": None,
+            "owner_worker_id": owner_worker_id,
+            "lease_expires_at": lease_expires_at,
+            "created_at": created_at or now,
+            "updated_at": now,
+        }
+        self._runs[run_id] = new_row
+        self._index_run(run_id, thread_id)
+        return new_row, claimed

@@ -15,7 +15,7 @@
 # ============================================================================
 # Bump this number when the config schema changes.
 # Run `make config-upgrade` to merge new fields into your local config.yaml.
-config_version: 20
+config_version: 21
 
 # ============================================================================
 # Logging
@@ -1545,6 +1545,18 @@ scheduler:
   lease_seconds: 120
   max_concurrent_runs: 3
   min_once_delay_seconds: 60
+
+# ============================================================================
+# Run Ownership Configuration
+# ============================================================================
+# Controls cross-process run ownership for multi-worker deployments.
+# When GATEWAY_WORKERS > 1, each worker claims runs with a lease; the heartbeat
+# renews leases, and reconciliation recovers orphaned runs from crashed workers.
+
+run_ownership:
+  lease_seconds: 30           # Seconds before a run lease expires if not renewed
+  grace_seconds: 10           # Extra seconds past expiry before an orphaned run is reclaimed
+  heartbeat_enabled: false    # Set to true for GATEWAY_WORKERS > 1
 
 # ============================================================================
 # Stream Bridge Configuration

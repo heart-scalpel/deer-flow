@@ -287,20 +287,29 @@ async def langgraph_runtime(app: FastAPI, startup_config: AppConfig) -> AsyncGen
         app.state.run_event_store = make_run_event_store(run_events_config)
 
         # RunManager with store backing for persistence
-        app.state.run_manager = RunManager(store=app.state.run_store)
-        if getattr(config.database, "backend", None) == "sqlite":
-            from deerflow.utils.time import now_iso
+        run_ownership_config = getattr(config, "run_ownership", None)
+        app.state.run_manager = RunManager(
+            store=app.state.run_store,
+            run_ownership_config=run_ownership_config,
+        )
+        # Startup recovery: mark inflight runs whose lease has expired as error.
+        # In single-worker mode (SQLite / backend=memory), no run has a lease, so
+        # all inflight rows are reclaimed (unchanged behaviour). In multi-worker
+        # mode (Postgres), only runs with an expired lease are reclaimed; runs
+        # owned by another live worker are skipped.
+        from deerflow.utils.time import now_iso
 
-            # Startup-only recovery: clean shutdowns return no active rows and
-            # the thread-status update below becomes a no-op.
-            recovered_runs = await app.state.run_manager.reconcile_orphaned_inflight_runs(
-                error="Gateway restarted before this run reached a durable final state.",
-                before=now_iso(),
-            )
-            sb_config = getattr(config, "stream_bridge", None)
-            cleanup_delay = getattr(sb_config, "recovered_stream_cleanup_delay_seconds", 60.0) if sb_config else 60.0
-            await _publish_recovered_run_stream_end(app.state.stream_bridge, recovered_runs, cleanup_delay=cleanup_delay)
-            await _mark_latest_recovered_threads_error(app.state.run_manager, app.state.thread_store, recovered_runs)
+        recovered_runs = await app.state.run_manager.reconcile_orphaned_inflight_runs(
+            error="Gateway restarted before this run reached a durable final state.",
+            before=now_iso(),
+        )
+        sb_config = getattr(config, "stream_bridge", None)
+        cleanup_delay = getattr(sb_config, "recovered_stream_cleanup_delay_seconds", 60.0) if sb_config else 60.0
+        await _publish_recovered_run_stream_end(app.state.stream_bridge, recovered_runs, cleanup_delay=cleanup_delay)
+        await _mark_latest_recovered_threads_error(app.state.run_manager, app.state.thread_store, recovered_runs)
+
+        # Start the lease heartbeat if enabled (multi-worker deployments).
+        await app.state.run_manager.start_heartbeat()
 
         try:
             yield
