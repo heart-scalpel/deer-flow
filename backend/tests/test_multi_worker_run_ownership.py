@@ -124,6 +124,44 @@ async def test_interrupt_creates_new_when_old_completed():
     assert new.status == RunStatus.pending
 
 
+@pytest.mark.anyio
+async def test_interrupt_exhausted_retries_surface_as_conflict_error():
+    """When all retry attempts collide with a unique violation, the loop must
+    surface ConflictError (HTTP 409) — matching the reject branch — instead of
+    leaking the raw IntegrityError (HTTP 500).
+
+    Without the post-loop conversion, the last attempt's ``raise`` re-raises
+    the IntegrityError, giving callers an inconsistent signal depending on
+    which strategy they picked. The reject path already converts; this test
+    pins the symmetric behaviour for interrupt/rollback.
+    """
+    import sqlite3
+
+    class _AlwaysUniqueViolationStore(MemoryRunStore):
+        """MemoryRunStore whose ``create_run_atomic`` always raises a
+        real-flavoured unique-violation IntegrityError, simulating a worker
+        that keeps losing the cross-worker race for the same thread."""
+
+        def __init__(self):
+            super().__init__()
+            self.atomic_call_count = 0
+
+        async def create_run_atomic(self, *args, **kwargs):
+            self.atomic_call_count += 1
+            err = sqlite3.IntegrityError("UNIQUE constraint failed: runs.uq_runs_thread_active")
+            err.sqlite_errorcode = sqlite3.SQLITE_CONSTRAINT_UNIQUE
+            raise err
+
+    store = _AlwaysUniqueViolationStore()
+    manager = _make_manager(store=store)
+
+    with pytest.raises(ConflictError, match="already has an active run"):
+        await manager.create_or_reject("thread-1", multitask_strategy="interrupt")
+
+    # Sanity: the loop actually retried 3 times before giving up.
+    assert store.atomic_call_count == 3
+
+
 # ---------------------------------------------------------------------------
 # create_or_reject — run ownership metadata
 # ---------------------------------------------------------------------------

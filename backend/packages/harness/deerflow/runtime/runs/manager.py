@@ -33,6 +33,12 @@ _RETRYABLE_SQLITE_ERROR_CODES = {
     sqlite3.SQLITE_LOCKED,
 }
 
+# Driver-native unique-constraint signals. These are stable across driver and
+# SQLAlchemy versions — message text is not (SQLite says "UNIQUE constraint
+# failed", Postgres says "duplicate key value violates unique constraint").
+_UNIQUE_PGCODE = "23505"
+_SQLITE_UNIQUE_ERRORCODE = sqlite3.SQLITE_CONSTRAINT_UNIQUE
+
 
 def _generate_worker_id() -> str:
     """Generate a unique worker identifier: ``hostname:hex_uuid``."""
@@ -42,9 +48,17 @@ def _generate_worker_id() -> str:
 def _is_unique_violation(exc: BaseException) -> bool:
     """Return True when *exc* (or its cause chain) is a unique-constraint violation.
 
-    SQLAlchemy wraps the driver's IntegrityError; the actual constraint-violation
-    message lives on ``exc.orig`` (psycopg/sqlite3). Walk the chain and check
-    each level's message so we don't miss the wrapped original.
+    SQLAlchemy wraps the driver's IntegrityError; the wrapped driver exception is
+    reachable via ``exc.orig`` (and ``__cause__`` / ``__context__``). Prefer
+    driver-native signals — psycopg ``pgcode`` / ``sqlcode`` = "23505" and
+    sqlite3 ``sqlite_errorcode`` = ``SQLITE_CONSTRAINT_UNIQUE`` — over message
+    matching, then fall back to message substrings for cases where the driver
+    exception isn't reachable through the chain.
+
+    Message text drifts across drivers and locales (SQLite raises
+    ``UNIQUE constraint failed: <table>.<index>``; Postgres raises
+    ``duplicate key value violates unique constraint``), so the code/attribute
+    checks are the load-bearing path.
     """
     pending: list[BaseException] = [exc]
     seen: set[int] = set()
@@ -53,11 +67,22 @@ def _is_unique_violation(exc: BaseException) -> bool:
         if id(current) in seen:
             continue
         seen.add(id(current))
+
+        if getattr(current, "pgcode", None) == _UNIQUE_PGCODE:
+            return True
+        if getattr(current, "sqlcode", None) == _UNIQUE_PGCODE:
+            return True
+        if getattr(current, "sqlite_errorcode", None) == _SQLITE_UNIQUE_ERRORCODE:
+            return True
+
         message = str(current).lower()
+        if "unique constraint failed" in message:
+            return True
         if "unique" in message and "violat" in message:
             return True
-        if "duplicate" in message:
+        if "duplicate key" in message:
             return True
+
         for attr in ("orig", "__cause__", "__context__"):
             inner = getattr(current, attr, None)
             if isinstance(inner, BaseException):
@@ -791,8 +816,15 @@ class RunManager:
                             )
                             break
                         except Exception as exc:
-                            if _is_unique_violation(exc) and attempt + 1 < max_retries:
+                            is_unique = _is_unique_violation(exc)
+                            if is_unique and attempt + 1 < max_retries:
                                 continue
+                            if is_unique:
+                                # Exhausted retries on unique violation — surface
+                                # as ConflictError to match the reject branch's
+                                # contract (409, not 500). Same root cause: another
+                                # worker won the race for this thread.
+                                raise ConflictError(f"Thread {thread_id} already has an active run") from exc
                             raise
                     # ``create_run_atomic`` already marked any claimed store
                     # rows as interrupted in the same transaction; no extra

@@ -8,6 +8,7 @@ from sqlalchemy.dialects import postgresql
 
 from deerflow.persistence.run import RunRepository
 from deerflow.runtime import RunManager, RunStatus
+from deerflow.runtime.runs.manager import ConflictError
 from deerflow.runtime.runs.store.base import RunStore
 
 
@@ -642,4 +643,91 @@ class TestRunRepository:
 
         row = await repo.get(record.run_id)
         assert row["model_name"] == "model-2"
+        await _cleanup()
+
+    @pytest.mark.anyio
+    async def test_create_run_atomic_reject_propagates_conflict_on_unique_violation(self, tmp_path):
+        """reject path against a real SQLite-backed store must surface as ConflictError, not raw IntegrityError.
+
+        The partial unique index ``uq_runs_thread_active`` is created by
+        ``Base.metadata.create_all`` on SQLite too. Every other atomic-create
+        test in the suite uses ``MemoryRunStore``, which raises ConflictError
+        directly and never exercises the manager's
+        ``_is_unique_violation``-based conversion. This test is the load-bearing
+        coverage for that branch on a real DB: pre-insert an active run on
+        thread T, then attempt a reject-strategy create for the same thread,
+        and assert ConflictError (HTTP 409) — not a leaking IntegrityError
+        (HTTP 500).
+        """
+        from datetime import UTC, datetime, timedelta
+
+        from deerflow.config.run_ownership_config import RunOwnershipConfig
+
+        repo = await _make_repo(tmp_path)
+        manager = RunManager(
+            store=repo,
+            run_ownership_config=RunOwnershipConfig(
+                lease_seconds=30,
+                grace_seconds=10,
+                heartbeat_enabled=False,
+            ),
+        )
+
+        # Pre-insert an active run on thread T directly through the store so
+        # the partial unique index has something to enforce on the second insert.
+        lease = (datetime.now(UTC) + timedelta(seconds=30)).isoformat()
+        await repo.create_run_atomic(
+            "run-A",
+            thread_id="thread-T",
+            owner_worker_id="worker-A",
+            lease_expires_at=lease,
+            multitask_strategy="reject",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+
+        # Second reject-strategy create against the same thread must convert the
+        # underlying IntegrityError into ConflictError via ``_is_unique_violation``.
+        with pytest.raises(ConflictError, match="already has an active run"):
+            await manager.create_or_reject(
+                "thread-T",
+                multitask_strategy="reject",
+            )
+
+        await _cleanup()
+
+    @pytest.mark.anyio
+    async def test_is_unique_violation_detects_real_sqlite_integrity_error(self, tmp_path):
+        """``_is_unique_violation`` must return True for a real SQLite IntegrityError.
+
+        SQLite raises ``UNIQUE constraint failed: runs.uq_runs_thread_active``
+        which contains "unique" but neither "violat" nor "duplicate" — the
+        previous substring-only heuristic returned False on SQLite, leaking the
+        raw IntegrityError. This test triggers a real violation against the
+        partial unique index and feeds the resulting SQLAlchemy IntegrityError
+        (with the wrapped sqlite3.IntegrityError on ``.orig``) through the
+        detector to assert True.
+        """
+        import sqlite3
+
+        from sqlalchemy.exc import IntegrityError
+
+        from deerflow.runtime.runs.manager import _is_unique_violation
+
+        repo = await _make_repo(tmp_path)
+
+        # First insert succeeds; second collides on the partial unique index.
+        await repo.put("first", thread_id="thread-T", status="pending")
+        with pytest.raises(IntegrityError) as exc_info:
+            await repo.put("second", thread_id="thread-T", status="pending")
+
+        # The wrapped driver exception must be a sqlite3 IntegrityError carrying
+        # SQLITE_CONSTRAINT_UNIQUE. Walk the chain so we assert on the actual
+        # driver-level signal, not the SQLAlchemy wrapper.
+        driver = exc_info.value.orig
+        assert isinstance(driver, sqlite3.IntegrityError)
+        assert driver.sqlite_errorcode == sqlite3.SQLITE_CONSTRAINT_UNIQUE
+
+        # The detector must return True regardless of message phrasing.
+        assert _is_unique_violation(exc_info.value) is True
+
         await _cleanup()
