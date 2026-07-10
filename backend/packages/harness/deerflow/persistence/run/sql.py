@@ -400,7 +400,7 @@ class RunRepository(RunStore):
             "updated_at": datetime.now(UTC),
         }
         async with self._sf() as session:
-            result = await session.execute(update(RunRow).where(RunRow.run_id == run_id, RunRow.status.in_(("pending", "running"))).values(**values))
+            result = await session.execute(update(RunRow).where(RunRow.run_id == run_id, RunRow.owner_worker_id == owner_worker_id, RunRow.status.in_(("pending", "running"))).values(**values))
             await session.commit()
             return result.rowcount != 0
 

@@ -806,6 +806,33 @@ async def test_update_lease_returns_false_for_terminal_run():
     assert stored["status"] == "success"
 
 
+@pytest.mark.anyio
+async def test_update_lease_returns_false_for_wrong_owner():
+    """update_lease must reject renewal when owner_worker_id does not match."""
+    store = MemoryRunStore()
+    old_lease = (datetime.now(UTC) + timedelta(seconds=5)).isoformat()
+    await store.put(
+        "run-1",
+        thread_id="thread-1",
+        status="running",
+        owner_worker_id="w1",
+        lease_expires_at=old_lease,
+    )
+
+    new_lease = (datetime.now(UTC) + timedelta(seconds=30)).isoformat()
+    updated = await store.update_lease(
+        "run-1",
+        owner_worker_id="w2",  # different worker
+        lease_expires_at=new_lease,
+    )
+    assert updated is False
+
+    # The original lease must be untouched
+    stored = await store.get("run-1")
+    assert stored["owner_worker_id"] == "w1"
+    assert stored["lease_expires_at"] == old_lease
+
+
 # ---------------------------------------------------------------------------
 # list_inflight_with_expired_lease
 # ---------------------------------------------------------------------------

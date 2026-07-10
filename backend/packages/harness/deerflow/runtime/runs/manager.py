@@ -447,7 +447,15 @@ class RunManager:
         multitask_strategy: str = "reject",
         user_id: str | None = None,
     ) -> RunRecord:
-        """Create a new pending run and register it."""
+        """Create a new pending run and register it.
+
+        Note: this method assumes no active run exists for the thread. It
+        persists via ``store.put`` (upsert) rather than the atomic
+        ``create_run_atomic`` primitive, so a concurrent insert for the
+        same thread will hit the partial unique index and surface as a
+        raw ``IntegrityError`` instead of a ``ConflictError``. Production
+        callers should use :meth:`create_or_reject`.
+        """
         run_id = str(uuid.uuid4())
         now = _now_iso()
         lease_expires_at = self._compute_lease_expires_at()

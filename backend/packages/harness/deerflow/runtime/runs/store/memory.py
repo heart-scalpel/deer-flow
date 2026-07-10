@@ -150,6 +150,10 @@ class MemoryRunStore(RunStore):
                     entry["tokens"] += usage.get("total_tokens", 0)
                     entry["runs"] += 1
             else:
+                # Fallback for rows written before per-model accounting landed:
+                # attribute the whole run to its single ``model_name``. Keeps
+                # the legacy lead-only behavior for old data instead of
+                # silently dropping it.
                 model = r.get("model_name") or "unknown"
                 entry = by_model.setdefault(model, {"tokens": 0, "runs": 0})
                 entry["tokens"] += r.get("total_tokens", 0)
@@ -182,6 +186,8 @@ class MemoryRunStore(RunStore):
         if run is None:
             return False
         if run["status"] not in ("pending", "running"):
+            return False
+        if run.get("owner_worker_id") != owner_worker_id:
             return False
         run["owner_worker_id"] = owner_worker_id
         run["lease_expires_at"] = lease_expires_at
