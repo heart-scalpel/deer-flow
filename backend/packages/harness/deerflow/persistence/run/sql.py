@@ -15,7 +15,6 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from deerflow.persistence.run.model import RunRow
-from deerflow.runtime.runs.manager import ConflictError
 from deerflow.runtime.runs.store.base import RunStore
 from deerflow.runtime.user_context import AUTO, _AutoSentinel, resolve_user_id
 from deerflow.utils.time import coerce_iso
@@ -463,6 +462,8 @@ class RunRepository(RunStore):
         Returns:
             Tuple of ``(new_run_dict, claimed_run_dicts)``.
         """
+        from deerflow.runtime.runs.manager import ConflictError
+
         resolved_user_id = resolve_user_id(user_id or AUTO, method_name="RunRepository.create_run_atomic")
         now = datetime.now(UTC)
         created = datetime.fromisoformat(created_at) if created_at else now

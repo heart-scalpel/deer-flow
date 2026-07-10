@@ -8,7 +8,6 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from deerflow.runtime.runs.manager import ConflictError
 from deerflow.runtime.runs.store.base import RunStore
 
 
@@ -195,13 +194,20 @@ class MemoryRunStore(RunStore):
         before: str | None = None,
         grace_seconds: int = 10,
     ) -> list[dict[str, Any]]:
-        now = before or datetime.now(UTC).isoformat()
+        now_dt = datetime.fromisoformat(before) if before else datetime.now(UTC)
         cutoff = datetime.now(UTC) - timedelta(seconds=grace_seconds)
         results = []
         for r in self._runs.values():
             if r["status"] not in ("pending", "running"):
                 continue
-            if r.get("created_at", "") > now:
+            created_at = r.get("created_at", "")
+            if not created_at:
+                continue
+            try:
+                created_dt = datetime.fromisoformat(created_at)
+            except (ValueError, TypeError):
+                continue
+            if created_dt > now_dt:
                 continue
             lease = r.get("lease_expires_at")
             if lease is None:
@@ -210,6 +216,13 @@ class MemoryRunStore(RunStore):
             else:
                 try:
                     lease_dt = datetime.fromisoformat(lease)
+                    # Treat naive values as UTC — same convention as
+                    # ``coerce_iso`` in the SQL store, so the comparison
+                    # against the aware ``cutoff`` does not raise
+                    # ``TypeError`` when heartbeat is enabled on SQLite
+                    # (which drops tzinfo on read).
+                    if lease_dt.tzinfo is None:
+                        lease_dt = lease_dt.replace(tzinfo=UTC)
                     if lease_dt < cutoff:
                         results.append(r)
                 except (ValueError, TypeError):
@@ -233,6 +246,8 @@ class MemoryRunStore(RunStore):
         created_at: str | None = None,
         grace_seconds: int = 10,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        from deerflow.runtime.runs.manager import ConflictError
+
         now = datetime.now(UTC).isoformat()
         cutoff = datetime.now(UTC) - timedelta(seconds=grace_seconds)
 
@@ -261,6 +276,12 @@ class MemoryRunStore(RunStore):
                 if existing_lease is not None:
                     try:
                         lease_dt = datetime.fromisoformat(existing_lease)
+                        # Treat naive values as UTC — same convention as
+                        # the SQL store and ``coerce_iso``, so the
+                        # comparison against the aware ``cutoff`` does not
+                        # raise ``TypeError``.
+                        if lease_dt.tzinfo is None:
+                            lease_dt = lease_dt.replace(tzinfo=UTC)
                         if lease_dt >= cutoff and r.get("owner_worker_id") != owner_worker_id:
                             # Live run owned by another worker — cannot
                             # interrupt, and the partial unique index would

@@ -47,9 +47,17 @@ _RUN_DRAIN_TIMEOUT_SECONDS = 5.0
 
 
 def _enforce_postgres_for_multi_worker(config: AppConfig) -> None:
-    """Refuse to start when GATEWAY_WORKERS > 1 and the DB backend is not Postgres.
+    """Refuse to start when GATEWAY_WORKERS > 1 and safety preconditions are not met.
 
-    SQLite write-locks cannot support concurrent multi-process access.
+    Two checks (both must pass for multi-worker):
+
+    1. The DB backend must be Postgres — SQLite write-locks cannot support
+       concurrent multi-process access.
+    2. ``run_ownership.heartbeat_enabled`` must be True — without heartbeat,
+       every run has a NULL lease, so reconciliation treats all inflight
+       runs as orphans and Worker B would kill Worker A's live runs on
+       every rolling update or scale-up.
+
     This gate runs once at startup before any persistence engine is
     initialised so the error message is clear and the process exits
     immediately.
@@ -65,6 +73,16 @@ def _enforce_postgres_for_multi_worker(config: AppConfig) -> None:
     backend = getattr(config.database, "backend", None)
     if backend != "postgres":
         raise SystemExit(f"GATEWAY_WORKERS={workers} requires database.backend='postgres', but database.backend is '{backend}'. SQLite cannot support concurrent multi-process access. Set GATEWAY_WORKERS=1 or switch to Postgres.")
+
+    run_ownership = getattr(config, "run_ownership", None)
+    if run_ownership is None or not run_ownership.heartbeat_enabled:
+        raise SystemExit(
+            f"GATEWAY_WORKERS={workers} requires run_ownership.heartbeat_enabled=true. "
+            "Without heartbeat, every run has a NULL lease, so reconciliation "
+            "treats all inflight runs as orphans — Worker B would kill Worker A's "
+            "live runs on every rolling update or scale-up. "
+            "Set run_ownership.heartbeat_enabled=true in config.yaml."
+        )
 
 
 async def _drain_inflight_runs(run_manager: RunManager) -> None:

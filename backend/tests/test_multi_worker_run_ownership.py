@@ -839,3 +839,102 @@ async def test_list_inflight_with_expired_lease_filters_correctly():
     assert "null-lease-run" in result_ids
     assert "valid-run" not in result_ids
     assert "success-run" not in result_ids
+
+
+# ---------------------------------------------------------------------------
+# MemoryRunStore — datetime comparison for created_at filtering
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_list_inflight_with_expired_lease_compares_created_at_as_datetime():
+    """``before`` filter must use datetime comparison, not string lexical order.
+
+    ISO-8601 strings compare lexically only when every component is zero-padded
+    to the same width and the timezone suffix matches. Datetime parsing is
+    order-safe regardless of format.
+    """
+    store = MemoryRunStore()
+    now = datetime.now(UTC)
+    grace = 10
+
+    # A run created "now" — should be included when before=None (defaults to now).
+    await store.put("recent-run", thread_id="t1", status="running", created_at=now.isoformat())
+    # A run created far in the future — should be excluded by the before filter
+    # even though the string "2300-01-01..." > "2025-..." lexically.
+    far_future = "2300-01-01T00:00:00+00:00"
+    await store.put("future-run", thread_id="t2", status="running", created_at=far_future)
+
+    results = await store.list_inflight_with_expired_lease(before=now.isoformat(), grace_seconds=grace)
+    result_ids = {r["run_id"] for r in results}
+    assert "recent-run" in result_ids
+    assert "future-run" not in result_ids
+
+
+@pytest.mark.anyio
+async def test_list_inflight_with_expired_lease_handles_malformed_created_at():
+    """Malformed ``created_at`` values must not crash the listing."""
+    store = MemoryRunStore()
+    grace = 10
+
+    store._runs["bad-run"] = {
+        "run_id": "bad-run",
+        "thread_id": "t1",
+        "status": "running",
+        "created_at": "not-a-datetime",
+    }
+    store._runs["empty-run"] = {
+        "run_id": "empty-run",
+        "thread_id": "t2",
+        "status": "running",
+        "created_at": "",
+    }
+
+    results = await store.list_inflight_with_expired_lease(grace_seconds=grace)
+    # Both should be skipped because their created_at can't be parsed
+    result_ids = {r["run_id"] for r in results}
+    assert "bad-run" not in result_ids
+    assert "empty-run" not in result_ids
+
+
+@pytest.mark.anyio
+async def test_list_inflight_with_expired_lease_datetime_aware_naive_handling():
+    """Lease comparison must handle aware and naive datetimes.
+
+    ``lease_expires_at`` stored with a trailing ``+00:00`` (aware) and without
+    (naive) should both be comparable against the aware ``cutoff``. The MemoryRunStore
+    uses ``datetime.fromisoformat`` which preserves the offset, so both paths
+    must work.
+    """
+    store = MemoryRunStore()
+    now = datetime.now(UTC)
+    grace = 10
+
+    # Naive datetime (no timezone suffix) — common on SQLite read-back
+    naive_expired = (now - timedelta(seconds=60)).isoformat()  # "2025-01-01T00:00:00"
+    await store.put("naive-run", thread_id="t1", status="running", lease_expires_at=naive_expired, created_at=naive_expired)
+
+    # Aware datetime (with +00:00)
+    aware_expired = (now - timedelta(seconds=60)).replace(tzinfo=UTC).isoformat()  # "2025-01-01T00:00:00+00:00"
+    await store.put("aware-run", thread_id="t2", status="running", lease_expires_at=aware_expired, created_at=aware_expired)
+
+    results = await store.list_inflight_with_expired_lease(grace_seconds=grace)
+    result_ids = {r["run_id"] for r in results}
+    # Both expired, both should be returned
+    assert "naive-run" in result_ids
+    assert "aware-run" in result_ids
+
+
+@pytest.mark.anyio
+async def test_list_inflight_with_expired_lease_null_lease_always_reclaimed():
+    """NULL lease rows are always reclaimed regardless of created_at value."""
+    store = MemoryRunStore()
+    grace = 10
+
+    # NULL lease is the single-worker mode default — every inflight row
+    # must be returned so reconciliation can reclaim it.
+    await store.put("null-run", thread_id="t1", status="running", created_at=datetime.now(UTC).isoformat())
+
+    results = await store.list_inflight_with_expired_lease(grace_seconds=grace)
+    result_ids = {r["run_id"] for r in results}
+    assert "null-run" in result_ids
