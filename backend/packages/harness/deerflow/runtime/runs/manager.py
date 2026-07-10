@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy.exc import IntegrityError as SAIntegrityError
+
 from deerflow.utils.time import now_iso as _now_iso
 
 from .schemas import DisconnectMode, RunStatus
@@ -75,13 +77,21 @@ def _is_unique_violation(exc: BaseException) -> bool:
         if getattr(current, "sqlite_errorcode", None) == _SQLITE_UNIQUE_ERRORCODE:
             return True
 
-        message = str(current).lower()
-        if "unique constraint failed" in message:
-            return True
-        if "unique" in message and "violat" in message:
-            return True
-        if "duplicate key" in message:
-            return True
+        # Message fallbacks are belt-and-suspenders for drivers whose
+        # native code attribute isn't reachable through the chain. Gate on
+        # an IntegrityError-typed node so an unrelated application
+        # exception whose ``str()`` happens to contain "duplicate key" /
+        # "unique" + "violat" (CHECK constraint message, validation error,
+        # arbitrary subsystem string) cannot be misclassified as a unique
+        # violation and silently surface as HTTP 409 instead of 500.
+        if isinstance(current, (SAIntegrityError, sqlite3.IntegrityError)):
+            message = str(current).lower()
+            if "unique constraint failed" in message:
+                return True
+            if "unique" in message and "violat" in message:
+                return True
+            if "duplicate key" in message:
+                return True
 
         for attr in ("orig", "__cause__", "__context__"):
             inner = getattr(current, attr, None)
@@ -996,7 +1006,19 @@ class RunManager:
             except TimeoutError:
                 pass  # interval elapsed, renew leases
 
-            await self._renew_leases()
+            # Guard the renewal sweep so the heartbeat task can never die
+            # silently. The per-run try/except inside ``_renew_leases``
+            # already handles store failures, but a transient error from
+            # the snapshot path or an unexpected exception must not take
+            # the heartbeat down — a dead heartbeat means no lease is
+            # renewed again, and every active run eventually looks
+            # orphaned to peers. ``except Exception`` lets
+            # ``CancelledError`` (a ``BaseException`` since 3.8) propagate
+            # so shutdown cancellation still works.
+            try:
+                await self._renew_leases()
+            except Exception:
+                logger.warning("Heartbeat renewal cycle failed", exc_info=True)
 
     async def _renew_leases(self) -> None:
         """Renew the lease on every locally-owned active run."""
@@ -1006,16 +1028,36 @@ class RunManager:
         new_expiry = (datetime.now(UTC) + timedelta(seconds=lease_seconds)).isoformat()
 
         async with self._lock:
-            active_runs = [(rid, record) for rid, record in self._runs.items() if record.status in (RunStatus.pending, RunStatus.running) and record.owner_worker_id == self._worker_id and record.task is not None and not record.task.done()]
+            # Renew any pending/running run owned by this worker unless its
+            # background task has already completed. A pending run whose task
+            # has not been spawned yet (``task is None``) is still live from
+            # this worker's perspective — between ``create_run_atomic``
+            # inserting the row and the worker layer spawning the agent task
+            # there is a brief window. If we drop those records here and the
+            # window stretches past ``lease_seconds`` (e.g. event-loop
+            # saturation, slow checkpoint hydrate on a fresh worker), peer
+            # reconciliation will reclaim the run as an orphan and mark it
+            # ``error`` even though this worker still intends to execute it.
+            active_runs = [(rid, record) for rid, record in self._runs.items() if record.status in (RunStatus.pending, RunStatus.running) and record.owner_worker_id == self._worker_id and (record.task is None or not record.task.done())]
 
         for run_id, record in active_runs:
             try:
-                updated = await self._store.update_lease(
+                updated = await self._call_store_with_retry(
+                    "update_lease",
                     run_id,
-                    owner_worker_id=self._worker_id,
-                    lease_expires_at=new_expiry,
+                    lambda: self._store.update_lease(
+                        run_id,
+                        owner_worker_id=self._worker_id,
+                        lease_expires_at=new_expiry,
+                    ),
                 )
                 if updated:
+                    # Unsynced write is benign: ``lease_expires_at`` is the
+                    # only field on an existing record this path mutates, so
+                    # there is no concurrent writer to race against
+                    # (``set_status`` / ``_persist_status`` touch other
+                    # fields). Re-acquiring ``self._lock`` here would
+                    # serialise against unrelated run mutations for no gain.
                     record.lease_expires_at = new_expiry
             except Exception:
                 logger.warning("Failed to renew lease for run %s", run_id, exc_info=True)

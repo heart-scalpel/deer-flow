@@ -217,39 +217,6 @@ class MemoryRunStore(RunStore):
         results.sort(key=lambda r: r["created_at"])
         return results
 
-    async def claim_inflight_runs(
-        self,
-        thread_id: str,
-        *,
-        owner_worker_id: str,
-        lease_expires_at: str,
-        now_iso: str,
-        grace_seconds: int,
-    ) -> list[dict[str, Any]]:
-        cutoff = datetime.now(UTC) - timedelta(seconds=grace_seconds)
-        claimed = []
-        for r in self._runs.values():
-            if r["thread_id"] != thread_id:
-                continue
-            if r["status"] not in ("pending", "running"):
-                continue
-            existing_lease = r.get("lease_expires_at")
-            if existing_lease is not None:
-                try:
-                    lease_dt = datetime.fromisoformat(existing_lease)
-                    if lease_dt >= cutoff and r.get("owner_worker_id") != owner_worker_id:
-                        # Lease still valid and owned by another live worker
-                        continue
-                except (ValueError, TypeError):
-                    pass
-            # Claim: mark as interrupted
-            r["status"] = "interrupted"
-            r["error"] = "Cancelled by newer run"
-            r["owner_worker_id"] = owner_worker_id
-            r["updated_at"] = datetime.now(UTC).isoformat()
-            claimed.append(r)
-        return claimed
-
     async def create_run_atomic(
         self,
         run_id: str,

@@ -434,46 +434,6 @@ class RunRepository(RunStore):
             result = await session.execute(stmt)
             return [self._row_to_dict(r) for r in result.scalars()]
 
-    async def claim_inflight_runs(
-        self,
-        thread_id: str,
-        *,
-        owner_worker_id: str,
-        lease_expires_at: str,
-        now_iso: str,
-        grace_seconds: int,
-    ) -> list[dict[str, Any]]:
-        cutoff = datetime.now(UTC) - timedelta(seconds=grace_seconds)
-        async with self._sf() as session:
-            # SELECT ... FOR UPDATE locks the inflight rows for this thread.
-            # Partial unique index on (thread_id WHERE status IN ('pending','running'))
-            # guarantees at most one active row per thread, so this locks at most
-            # one row. Still handles edge case of legacy data with multiple rows.
-            stmt = (
-                select(RunRow)
-                .where(
-                    RunRow.thread_id == thread_id,
-                    RunRow.status.in_(("pending", "running")),
-                )
-                .with_for_update()
-            )
-            result = await session.execute(stmt)
-            rows = list(result.scalars())
-
-            claimed = []
-            for row in rows:
-                if row.lease_expires_at is not None and row.lease_expires_at >= cutoff and row.owner_worker_id != owner_worker_id:
-                    # Lease still valid and owned by another live worker — skip.
-                    continue
-                row.status = "interrupted"
-                row.error = "Cancelled by newer run"
-                row.owner_worker_id = owner_worker_id
-                row.updated_at = datetime.now(UTC)
-                claimed.append(self._row_to_dict(row))
-
-            await session.commit()
-            return claimed
-
     async def create_run_atomic(
         self,
         run_id: str,

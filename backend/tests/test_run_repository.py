@@ -63,9 +63,6 @@ class _CustomRunStoreWithoutProgress(RunStore):
     async def list_inflight_with_expired_lease(self, *args, **kwargs):
         return []
 
-    async def claim_inflight_runs(self, *args, **kwargs):
-        return []
-
     async def create_run_atomic(self, *args, **kwargs):
         return {}, []
 
@@ -731,3 +728,21 @@ class TestRunRepository:
         assert _is_unique_violation(exc_info.value) is True
 
         await _cleanup()
+
+    @pytest.mark.anyio
+    async def test_is_unique_violation_does_not_misclassify_application_exception(self):
+        """Message fallbacks must not fire on non-IntegrityError exceptions.
+
+        A ``ValueError`` / ``RuntimeError`` whose ``str()`` happens to
+        contain ``"duplicate key"`` or ``"unique" + "violat"`` substrings
+        must NOT be classified as a unique violation — that would silently
+        mask real application bugs as HTTP 409 conflicts instead of 500.
+        Pre-fix the substring-only fallback fired regardless of exception
+        type. The fix gates the fallback on
+        ``isinstance(current, (SAIntegrityError, sqlite3.IntegrityError))``.
+        """
+        from deerflow.runtime.runs.manager import _is_unique_violation
+
+        assert _is_unique_violation(ValueError("duplicate key in input data: 'email'")) is False
+        assert _is_unique_violation(RuntimeError("unique violat detected in config")) is False
+        assert _is_unique_violation(Exception("unique constraint failed (in a unit test mock)")) is False

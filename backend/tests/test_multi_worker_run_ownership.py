@@ -377,6 +377,45 @@ async def test_heartbeat_renews_active_run_leases():
 
 
 @pytest.mark.anyio
+async def test_heartbeat_renews_pending_run_before_task_is_spawned():
+    """A run sitting in ``pending`` between ``create_run_atomic`` and task
+    spawn must still have its lease renewed.
+
+    Pre-fix the renewal filter required ``record.task is not None``, so a
+    pending run with no task yet (the brief window after
+    ``create_run_atomic`` inserts the row before the worker layer spawns
+    the agent task) was silently skipped. If that window stretched past
+    ``lease_seconds`` — e.g. event-loop saturation, slow checkpoint
+    hydrate — peer reconciliation reclaimed the run as an orphan and
+    marked it ``error`` even though this worker still intended to run it.
+    """
+    config = _lease_config(lease_seconds=30, heartbeat_enabled=True)
+    store = MemoryRunStore()
+    manager = _make_manager(store=store, run_ownership_config=config)
+
+    record = await manager.create_or_reject("thread-1")
+    assert record.status == RunStatus.pending
+    # No task has been spawned — this is the regression sentinel.
+    assert record.task is None
+
+    original_lease = record.lease_expires_at
+    assert original_lease is not None
+
+    # Force a measurable gap so the renewed lease strictly post-dates the
+    # original — without this the two timestamps land in the same
+    # microsecond on fast hosts and the strict comparison fails trivially.
+    await asyncio.sleep(0.001)
+
+    store.update_lease = AsyncMock(wraps=store.update_lease)
+
+    await manager._renew_leases()
+
+    store.update_lease.assert_awaited_once()
+    assert record.lease_expires_at is not None
+    assert record.lease_expires_at > original_lease
+
+
+@pytest.mark.anyio
 async def test_heartbeat_skips_runs_not_owned_by_this_worker():
     """Heartbeat must only renew leases for runs owned by this worker."""
     config = _lease_config(lease_seconds=30, heartbeat_enabled=True)

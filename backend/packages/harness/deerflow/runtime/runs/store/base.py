@@ -167,24 +167,6 @@ class RunStore(abc.ABC):
         pass
 
     @abc.abstractmethod
-    async def claim_inflight_runs(
-        self,
-        thread_id: str,
-        *,
-        owner_worker_id: str,
-        lease_expires_at: str,
-        now_iso: str,
-        grace_seconds: int,
-    ) -> list[dict[str, Any]]:
-        """Claim ownership of inflight runs for *thread_id* by cancelling them.
-
-        Uses SELECT FOR UPDATE to lock conflicting rows. Skips rows whose
-        lease is still valid (owned by another live worker). Returns the rows
-        that were successfully claimed and cancelled.
-        """
-        pass
-
-    @abc.abstractmethod
     async def create_run_atomic(
         self,
         run_id: str,
