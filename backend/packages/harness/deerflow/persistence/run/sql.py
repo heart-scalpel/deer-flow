@@ -498,13 +498,25 @@ class RunRepository(RunStore):
                 )
                 result = await session.execute(stmt)
                 for row in result.scalars():
-                    if row.lease_expires_at is not None and row.lease_expires_at >= cutoff and row.owner_worker_id != owner_worker_id:
-                        # Live run owned by another worker — we cannot interrupt
-                        # it and the partial unique index would reject our
-                        # INSERT anyway. Surface as ConflictError so the caller
-                        # gets a clean signal instead of a retry loop on
-                        # IntegrityError.
-                        raise ConflictError(f"Thread {thread_id} already has an active run owned by another worker")
+                    if row.lease_expires_at is not None:
+                        # SQLite drops tzinfo on read despite
+                        # ``DateTime(timezone=True)`` (see ``_row_to_dict``).
+                        # Treat naive values as UTC — same convention as
+                        # ``coerce_iso`` — so the Python-side comparison
+                        # against the aware ``cutoff`` does not raise
+                        # ``TypeError: can't compare offset-naive and
+                        # offset-aware datetimes`` when heartbeat is enabled
+                        # on SQLite.
+                        row_lease = row.lease_expires_at
+                        if row_lease.tzinfo is None:
+                            row_lease = row_lease.replace(tzinfo=UTC)
+                        if row_lease >= cutoff and row.owner_worker_id != owner_worker_id:
+                            # Live run owned by another worker — we cannot
+                            # interrupt it and the partial unique index would
+                            # reject our INSERT anyway. Surface as
+                            # ConflictError so the caller gets a clean signal
+                            # instead of a retry loop on IntegrityError.
+                            raise ConflictError(f"Thread {thread_id} already has an active run owned by another worker")
                     row.status = "interrupted"
                     row.error = "Cancelled by newer run"
                     row.owner_worker_id = owner_worker_id

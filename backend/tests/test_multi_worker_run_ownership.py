@@ -690,6 +690,74 @@ async def test_create_run_atomic_interrupt_allows_self_owned_valid_lease():
     assert claimed[0]["status"] == "interrupted"
 
 
+@pytest.mark.anyio
+async def test_create_run_atomic_interrupt_rolls_back_earlier_mutations_on_conflict():
+    """Interrupt must not leave earlier candidates interrupted when a later
+    candidate raises ConflictError.
+
+    Mirrors the SQL store's transactional semantics: the whole interrupt pass
+    is one transaction, so a raise on any candidate must roll back mutations
+    already applied to earlier candidates. Without this, the memory store
+    diverges from SQL (which the production path uses), and the
+    test_multi_worker_run_ownership.py suite gives false confidence by
+    passing against memory while SQL would behave differently.
+
+    Setup: expired-lease run (interruptible) inserted FIRST, then a
+    valid-lease run owned by another worker. Iteration order means the
+    expired run is mutated before the valid-lease run raises — so a naive
+    single-pass implementation would leave the expired run interrupted.
+    """
+    store = MemoryRunStore()
+    config = _lease_config(grace_seconds=10)
+    expired_lease = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()
+    valid_lease = (datetime.now(UTC) + timedelta(seconds=30)).isoformat()
+
+    # Seed both active rows directly via ``put`` (bypassing create_run_atomic's
+    # reject check, which would refuse the second row). Insert the
+    # interruptible run first so dict iteration visits it first — that's the
+    # ordering that exposes the half-interrupted divergence in a naive
+    # single-pass implementation.
+    await store.put(
+        "expired-run",
+        thread_id="thread-1",
+        status="pending",
+        owner_worker_id="old-worker",
+        lease_expires_at=expired_lease,
+    )
+    await store.put(
+        "valid-lease-run",
+        thread_id="thread-1",
+        status="pending",
+        owner_worker_id="other-worker",
+        lease_expires_at=valid_lease,
+    )
+
+    with pytest.raises(ConflictError, match="another worker"):
+        await store.create_run_atomic(
+            run_id="run-new",
+            thread_id="thread-1",
+            owner_worker_id="w1",
+            lease_expires_at=(datetime.now(UTC) + timedelta(seconds=30)).isoformat(),
+            multitask_strategy="interrupt",
+            grace_seconds=config.grace_seconds,
+        )
+
+    # The expired run must be UNTOUCHED — the interrupt pass must roll back
+    # on ConflictError, not leave a half-interrupted store.
+    expired_row = await store.get("expired-run")
+    assert expired_row["status"] == "pending"
+    assert expired_row["owner_worker_id"] == "old-worker"
+    assert expired_row["error"] is None
+
+    # The valid-lease run that caused the conflict is also untouched.
+    valid_row = await store.get("valid-lease-run")
+    assert valid_row["status"] == "pending"
+    assert valid_row["owner_worker_id"] == "other-worker"
+
+    # The new run was never inserted.
+    assert await store.get("run-new") is None
+
+
 # ---------------------------------------------------------------------------
 # update_lease
 # ---------------------------------------------------------------------------

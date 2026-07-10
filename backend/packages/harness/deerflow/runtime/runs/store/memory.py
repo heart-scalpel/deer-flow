@@ -242,9 +242,16 @@ class MemoryRunStore(RunStore):
                 if r["thread_id"] == thread_id and r["status"] in ("pending", "running"):
                     raise ConflictError(f"Thread {thread_id} already has an active run")
 
-        # For interrupt/rollback: claim inflight runs
+        # For interrupt/rollback: claim inflight runs.
+        # Two-pass so the memory path mirrors the SQL store's transactional
+        # semantics — if any candidate is a live run owned by another worker
+        # we must raise ConflictError WITHOUT having already mutated earlier
+        # candidates. Mutating inline would leave the store in a half-
+        # interrupted state on raise, diverging from SQL where a raise rolls
+        # the whole transaction back.
         claimed = []
         if multitask_strategy in ("interrupt", "rollback"):
+            candidates: list[dict[str, Any]] = []
             for r in self._runs.values():
                 if r["thread_id"] != thread_id:
                     continue
@@ -258,10 +265,13 @@ class MemoryRunStore(RunStore):
                             # Live run owned by another worker — cannot
                             # interrupt, and the partial unique index would
                             # reject the INSERT anyway. Surface as ConflictError
-                            # so the caller gets a clean signal.
+                            # so the caller gets a clean signal. Raise before
+                            # any mutation so the store is left untouched.
                             raise ConflictError(f"Thread {thread_id} already has an active run owned by another worker")
                     except (ValueError, TypeError):
                         pass
+                candidates.append(r)
+            for r in candidates:
                 r["status"] = "interrupted"
                 r["error"] = "Cancelled by newer run"
                 r["owner_worker_id"] = owner_worker_id

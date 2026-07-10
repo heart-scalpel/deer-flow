@@ -746,3 +746,51 @@ class TestRunRepository:
         assert _is_unique_violation(ValueError("duplicate key in input data: 'email'")) is False
         assert _is_unique_violation(RuntimeError("unique violat detected in config")) is False
         assert _is_unique_violation(Exception("unique constraint failed (in a unit test mock)")) is False
+
+    @pytest.mark.anyio
+    async def test_create_run_atomic_interrupt_tolerates_tz_naive_lease_on_sqlite(self, tmp_path):
+        """Interrupt path must not raise TypeError comparing naive vs aware datetimes.
+
+        SQLite drops tzinfo on read despite ``DateTime(timezone=True)`` (see
+        the comment in ``RunRepository._row_to_dict``). The interrupt branch
+        of ``create_run_atomic`` compares ``row.lease_expires_at`` against
+        the aware ``cutoff = datetime.now(UTC) - ...`` in Python. Under
+        default config (heartbeat disabled) leases are always NULL so the
+        ``is not None`` check short-circuits, but there is no guard against
+        ``heartbeat_enabled=true`` on SQLite — a naive lease would raise
+        ``TypeError: can't compare offset-naive and offset-aware datetimes``
+        and surface as an opaque 500.
+
+        Pre-fix this test fails with TypeError; post-fix it raises
+        ConflictError (the live other-worker run blocks the interrupt).
+        """
+        from datetime import UTC, datetime, timedelta
+
+        repo = await _make_repo(tmp_path)
+
+        # Seed an active run owned by another worker with a still-valid lease.
+        # The lease value is stored as ISO; SQLite reads it back as a tz-naive
+        # datetime — exactly the shape that triggered the bug.
+        valid_lease = (datetime.now(UTC) + timedelta(seconds=30)).isoformat()
+        await repo.create_run_atomic(
+            "valid-lease-run",
+            thread_id="thread-T",
+            owner_worker_id="other-worker",
+            lease_expires_at=valid_lease,
+            multitask_strategy="reject",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+
+        # The interrupt path must surface a clean ConflictError, not a
+        # TypeError from the naive-vs-aware comparison.
+        with pytest.raises(ConflictError, match="another worker"):
+            await repo.create_run_atomic(
+                "run-new",
+                thread_id="thread-T",
+                owner_worker_id="w1",
+                lease_expires_at=(datetime.now(UTC) + timedelta(seconds=30)).isoformat(),
+                multitask_strategy="interrupt",
+                created_at=datetime.now(UTC).isoformat(),
+            )
+
+        await _cleanup()

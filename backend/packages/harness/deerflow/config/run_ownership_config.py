@@ -38,9 +38,7 @@ class RunOwnershipConfig(BaseModel):
         default=10,
         ge=0,
         description=(
-            "Extra seconds past lease expiry before an orphaned run is reclaimed. "
-            "Also the clock-skew budget between workers — raise it if worker clocks "
-            "are not tightly synced; cost is slower recovery of genuinely dead-worker runs."
+            "Extra seconds past lease expiry before an orphaned run is reclaimed. Also the clock-skew budget between workers — raise it if worker clocks are not tightly synced; cost is slower recovery of genuinely dead-worker runs."
         ),
     )
     heartbeat_enabled: bool = Field(
