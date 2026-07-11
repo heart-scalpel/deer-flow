@@ -748,6 +748,30 @@ class TestRunRepository:
         assert _is_unique_violation(Exception("unique constraint failed (in a unit test mock)")) is False
 
     @pytest.mark.anyio
+    async def test_is_unique_violation_detects_psycopg3_sqlstate(self):
+        """psycopg3 exposes the error code via ``sqlstate``, not ``pgcode``.
+
+        On Postgres (the only supported multi-worker backend), psycopg3's
+        ``sqlstate=23505`` must be detected as a unique violation without
+        falling through to the message-substring fallback.
+        """
+        from sqlalchemy.exc import IntegrityError as SAIntegrityError
+
+        from deerflow.runtime.runs.manager import _is_unique_violation
+
+        # Simulate psycopg3's sqlstate attribute on a wrapped IntegrityError
+        dbapi_err = Exception()
+        dbapi_err.sqlstate = "23505"  # psycopg3 uses sqlstate
+
+        sa_err = SAIntegrityError(
+            "duplicate key value violates unique constraint",
+            params=None,
+            orig=dbapi_err,
+        )
+
+        assert _is_unique_violation(sa_err) is True
+
+    @pytest.mark.anyio
     async def test_create_run_atomic_interrupt_tolerates_tz_naive_lease_on_sqlite(self, tmp_path):
         """Interrupt path must not raise TypeError comparing naive vs aware datetimes.
 

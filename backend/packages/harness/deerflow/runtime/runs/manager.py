@@ -74,6 +74,8 @@ def _is_unique_violation(exc: BaseException) -> bool:
             return True
         if getattr(current, "sqlcode", None) == _UNIQUE_PGCODE:
             return True
+        if getattr(current, "sqlstate", None) == _UNIQUE_PGCODE:
+            return True
         if getattr(current, "sqlite_errorcode", None) == _SQLITE_UNIQUE_ERRORCODE:
             return True
 
@@ -1000,33 +1002,48 @@ class RunManager:
         logger.info("Run lease heartbeat stopped for worker %s", self._worker_id)
 
     async def _heartbeat_loop(self) -> None:
-        """Periodically renew the lease on active runs owned by this worker."""
+        """Periodically renew leases and reclaim orphaned runs from dead peers.
+
+        Lease renewal runs every ``lease_seconds / 3``. Reconciliation
+        (sweeping for expired leases owned by dead workers) runs every
+        ``lease_seconds`` (every 3rd cycle) so orphaned runs are recovered
+        without waiting for a pod restart.
+
+        Both operations are guarded so a transient failure cannot take the
+        heartbeat task down — a dead heartbeat means no lease is renewed
+        again, and every active run eventually looks orphaned to peers.
+        """
         if self._run_ownership_config is None or self._heartbeat_stop is None:
             return
         lease_seconds = self._run_ownership_config.lease_seconds
         interval = max(1, lease_seconds // 3)
         stop = self._heartbeat_stop
+        cycle = 0
 
         while not stop.is_set():
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
                 break  # stop event was set
             except TimeoutError:
-                pass  # interval elapsed, renew leases
+                pass  # interval elapsed
 
-            # Guard the renewal sweep so the heartbeat task can never die
-            # silently. The per-run try/except inside ``_renew_leases``
-            # already handles store failures, but a transient error from
-            # the snapshot path or an unexpected exception must not take
-            # the heartbeat down — a dead heartbeat means no lease is
-            # renewed again, and every active run eventually looks
-            # orphaned to peers. ``except Exception`` lets
-            # ``CancelledError`` (a ``BaseException`` since 3.8) propagate
-            # so shutdown cancellation still works.
+            cycle += 1
             try:
                 await self._renew_leases()
             except Exception:
                 logger.warning("Heartbeat renewal cycle failed", exc_info=True)
+
+            # Reconcile every 3rd cycle (= every lease_seconds). Startup
+            # reconciliation (in langgraph_runtime) covers the initial
+            # sweep; this periodic pass catches orphans whose lease
+            # expires between restarts — e.g. Worker A crashes, its
+            # replacement starts before the lease expires, and the
+            # startup pass skips the still-valid lease.
+            if cycle % 3 == 0:
+                try:
+                    await self._reconcile_orphans_periodic()
+                except Exception:
+                    logger.warning("Periodic orphan reconciliation failed", exc_info=True)
 
     async def _renew_leases(self) -> None:
         """Renew the lease on every locally-owned active run."""
@@ -1069,6 +1086,21 @@ class RunManager:
                     record.lease_expires_at = new_expiry
             except Exception:
                 logger.warning("Failed to renew lease for run %s", run_id, exc_info=True)
+
+    async def _reconcile_orphans_periodic(self) -> None:
+        """Sweep for expired leases owned by dead peers.
+
+        Called from ``_heartbeat_loop`` every ``lease_seconds``. Startup
+        reconciliation handles the initial sweep; this periodic pass
+        catches orphans whose lease expires between restarts.
+        """
+        error_msg = "Run lease expired — owning worker is unreachable."
+        recovered = await self.reconcile_orphaned_inflight_runs(error=error_msg)
+        if recovered:
+            logger.warning(
+                "Periodic reconciliation recovered %d orphaned run(s) as error",
+                len(recovered),
+            )
 
     async def shutdown(self, *, timeout: float = 5.0) -> None:
         """Cancel and bounded-await all in-flight runs on process shutdown.
