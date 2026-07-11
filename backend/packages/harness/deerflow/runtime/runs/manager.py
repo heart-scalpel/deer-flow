@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
@@ -130,6 +131,25 @@ def _is_retryable_persistence_error(exc: BaseException) -> bool:
             if isinstance(chained, BaseException):
                 pending.append(chained)
     return False
+
+
+def _is_lease_expired(lease_expires_at: str | None, *, grace_seconds: int) -> bool:
+    """Return ``True`` when *lease_expires_at* has elapsed past grace.
+
+    A NULL lease (pre-ownership data) is always considered expired so
+    take-over (cancel from a non-owning worker) can reclaim it in the
+    same way reconciliation does.  Unparseable timestamps are also
+    treated as expired (defence in depth).
+    """
+    if lease_expires_at is None:
+        return True
+    try:
+        dt = datetime.fromisoformat(lease_expires_at)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+    except (ValueError, TypeError):
+        return True
+    return dt < datetime.now(UTC) - timedelta(seconds=grace_seconds)
 
 
 @dataclass(frozen=True)
@@ -662,41 +682,117 @@ class RunManager:
         await self._persist_model_name(run_id, model_name)
         logger.info("Run %s model_name=%s", run_id, model_name)
 
-    async def cancel(self, run_id: str, *, action: str = "interrupt") -> bool:
+    async def cancel(self, run_id: str, *, action: str = "interrupt") -> CancelOutcome:
         """Request cancellation of a run.
+
+        When the call lands on the owning worker the run is cancelled
+        locally as before (in-memory abort + status persisted to store).
+
+        When the call lands on a non-owning worker in a multi-worker
+        deployment with heartbeat enabled:
+
+        - **Lease expired** — the run's lease has passed the grace
+          threshold, so this worker takes ownership and marks it as
+          ``error``.  The owning worker is assumed dead (its heartbeat
+          stopped renewing).
+
+        - **Lease still valid** — returns ``lease_valid_elsewhere`` so
+          the caller can return HTTP 409 + ``Retry-After`` to tell the
+          client when to retry.
+
+        In single-worker mode (``heartbeat_enabled=False``) store-only
+        hydrated runs that aren't in-memory return ``not_active_locally``,
+        preserving the original 409 behaviour.
 
         Args:
             run_id: The run ID to cancel.
-            action: "interrupt" keeps checkpoint, "rollback" reverts to pre-run state.
+            action: ``"interrupt"`` keeps checkpoint, ``"rollback"``
+                    reverts to pre-run state.
 
-        Sets the abort event with the action reason and cancels the asyncio task.
-        Returns ``True`` if cancellation was initiated **or** the run was already
-        interrupted (idempotent — a second cancel is a no-op success).
-        Returns ``False`` only when the run is unknown to this worker or has
-        reached a terminal state other than interrupted (completed, failed, etc.).
+        Returns:
+            A :class:`CancelOutcome` enum describing what happened.
         """
+        # ------------------------------------------------------------------
+        # Local path — this worker owns the run in-memory.
+        # ------------------------------------------------------------------
         async with self._lock:
             record = self._runs.get(run_id)
-            if record is None:
-                return False
-            if record.status == RunStatus.interrupted:
-                return True  # idempotent — already cancelled on this worker
-            if record.status not in (RunStatus.pending, RunStatus.running):
-                return False
-            record.abort_action = action
-            record.abort_event.set()
-            task_active = record.task is not None and not record.task.done()
-            record.finalizing = task_active
-            if task_active:
-                record.task.cancel()
-            record.status = RunStatus.interrupted
-            record.updated_at = _now_iso()
-        await self._persist_status(record, RunStatus.interrupted)
-        logger.info("Run %s cancelled (action=%s)", run_id, action)
-        return True
+            if record is not None:
+                if record.status == RunStatus.interrupted:
+                    return CancelOutcome.cancelled  # idempotent
+                if record.status not in (RunStatus.pending, RunStatus.running):
+                    return CancelOutcome.not_cancellable
+                record.abort_action = action
+                record.abort_event.set()
+                task_active = record.task is not None and not record.task.done()
+                record.finalizing = task_active
+                if task_active:
+                    record.task.cancel()
+                record.status = RunStatus.interrupted
+                record.updated_at = _now_iso()
+
+        # Persist outside the lock so store calls don't block other mutations.
+        if record is not None:
+            await self._persist_status(record, RunStatus.interrupted)
+            logger.info("Run %s cancelled (action=%s)", run_id, action)
+            return CancelOutcome.cancelled
+
+        # ------------------------------------------------------------------
+        # Non-local path — no in-memory record, must consult the store.
+        # ------------------------------------------------------------------
+
+        if not self.heartbeat_enabled:
+            return CancelOutcome.not_active_locally
+
+        if self._store is None:
+            return CancelOutcome.unknown
+
+        try:
+            row = await self._store.get(run_id)
+        except Exception:
+            logger.warning("Failed to fetch run %s from store during cancel", run_id, exc_info=True)
+            return CancelOutcome.unknown
+
+        if row is None:
+            return CancelOutcome.unknown
+
+        store_status = row.get("status")
+        if store_status not in ("pending", "running"):
+            return CancelOutcome.not_cancellable
+
+        grace_seconds = self.grace_seconds
+        lease_expires_at: str | None = row.get("lease_expires_at")
+
+        if not _is_lease_expired(lease_expires_at, grace_seconds=grace_seconds):
+            return CancelOutcome.lease_valid_elsewhere
+
+        take_over_msg = f"Run reclaimed by worker {self._worker_id}: the owning worker ({row.get('owner_worker_id')}) stopped renewing its lease and is presumed dead."
+        try:
+            taken = await self._call_store_with_retry(
+                "claim_for_takeover",
+                run_id,
+                lambda: self._store.claim_for_takeover(
+                    run_id,
+                    grace_seconds=grace_seconds,
+                    error=take_over_msg,
+                ),
+            )
+        except Exception:
+            logger.warning("Take-over claim for run %s failed with exception", run_id, exc_info=True)
+            return CancelOutcome.unknown
+
+        if taken:
+            logger.warning("Run %s taken over by worker %s (action=%s)", run_id, self._worker_id, action)
+            return CancelOutcome.taken_over
+
+        # The conditional UPDATE matched 0 rows — the owner renewed the
+        # lease between our read and write, or another worker already
+        # claimed it. Surface as lease-valid-elsewhere so the client can
+        # retry, same as the still-alive branch above.
+        return CancelOutcome.lease_valid_elsewhere
 
     def _compute_lease_expires_at(self) -> str | None:
-        """Compute the lease expiration timestamp for a new run.
+        """Return the lease expiry ISO timestamp for a freshly created run.
 
         Returns ``None`` when heartbeat is disabled (single-worker mode) so
         reconciliation treats crashed runs as orphans (NULL lease) and
@@ -967,6 +1063,11 @@ class RunManager:
             return False
         return self._run_ownership_config.heartbeat_enabled
 
+    @property
+    def grace_seconds(self) -> int:
+        """Return the configured grace seconds (or ``10`` when ownership is unconfigured)."""
+        return self._run_ownership_config.grace_seconds if self._run_ownership_config else 10
+
     async def start_heartbeat(self) -> None:
         """Start the background lease-renewal task.
 
@@ -1196,6 +1297,17 @@ class RunManager:
         if pending:
             logger.warning("Run drain exceeded %.1fs on shutdown; %d run task(s) still active and may race checkpointer teardown", timeout, len(pending))
         logger.info("Drained %d in-flight run(s) on shutdown (%d settled within %.1fs)", len(inflight), len(inflight) - len(pending), timeout)
+
+
+class CancelOutcome(StrEnum):
+    """Result of a :meth:`RunManager.cancel` call."""
+
+    cancelled = "cancelled"
+    taken_over = "taken_over"
+    lease_valid_elsewhere = "lease_valid_elsewhere"
+    not_cancellable = "not_cancellable"
+    not_active_locally = "not_active_locally"
+    unknown = "unknown"
 
 
 class ConflictError(Exception):

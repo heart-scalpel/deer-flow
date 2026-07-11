@@ -404,6 +404,30 @@ class RunRepository(RunStore):
             await session.commit()
             return result.rowcount != 0
 
+    async def claim_for_takeover(
+        self,
+        run_id: str,
+        *,
+        grace_seconds: int,
+        error: str,
+    ) -> bool:
+        cutoff = datetime.now(UTC) - timedelta(seconds=grace_seconds)
+        async with self._sf() as session:
+            result = await session.execute(
+                update(RunRow)
+                .where(
+                    RunRow.run_id == run_id,
+                    RunRow.status.in_(("pending", "running")),
+                    or_(
+                        RunRow.lease_expires_at.is_(None),
+                        RunRow.lease_expires_at < cutoff,
+                    ),
+                )
+                .values(status="error", error=error, updated_at=datetime.now(UTC))
+            )
+            await session.commit()
+            return result.rowcount != 0
+
     async def list_inflight_with_expired_lease(
         self,
         *,

@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy.dialects import postgresql
 
 from deerflow.persistence.run import RunRepository
-from deerflow.runtime import RunManager, RunStatus
+from deerflow.runtime import CancelOutcome, RunManager, RunStatus
 from deerflow.runtime.runs.manager import ConflictError
 from deerflow.runtime.runs.store.base import RunStore
 
@@ -65,6 +65,9 @@ class _CustomRunStoreWithoutProgress(RunStore):
 
     async def create_run_atomic(self, *args, **kwargs):
         return {}, []
+
+    async def claim_for_takeover(self, *args, **kwargs):
+        return False
 
 
 @pytest.mark.anyio
@@ -578,7 +581,7 @@ class TestRunRepository:
         cancelled = await manager.cancel(record.run_id)
         row = await repo.get(record.run_id)
 
-        assert cancelled is True
+        assert cancelled == CancelOutcome.cancelled
         assert row is not None
         assert row["status"] == "interrupted"
         await _cleanup()

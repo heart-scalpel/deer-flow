@@ -20,7 +20,7 @@ import pytest
 
 from deerflow.config.run_ownership_config import RunOwnershipConfig
 from deerflow.runtime import RunManager, RunStatus
-from deerflow.runtime.runs.manager import ConflictError, _generate_worker_id
+from deerflow.runtime.runs.manager import CancelOutcome, ConflictError, _generate_worker_id
 from deerflow.runtime.runs.store.memory import MemoryRunStore
 
 # ---------------------------------------------------------------------------
@@ -467,30 +467,30 @@ async def test_cancel_local_run_succeeds():
     await manager.set_status(record.run_id, RunStatus.running)
 
     result = await manager.cancel(record.run_id)
-    assert result is True
+    assert result == CancelOutcome.cancelled
     assert record.status == RunStatus.interrupted
 
 
 @pytest.mark.anyio
 async def test_cancel_unknown_run_returns_false():
-    """Cancel must return False for a run not known to this worker."""
+    """Cancel must return not_active_locally for a run not known to this worker (heartbeat off)."""
     store = MemoryRunStore()
     manager = _make_manager(store=store)
 
     result = await manager.cancel("nonexistent-run")
-    assert result is False
+    assert result == CancelOutcome.not_active_locally
 
 
 @pytest.mark.anyio
 async def test_cancel_idempotent():
-    """Cancel must return True when the run is already interrupted."""
+    """Cancel must return cancelled when the run is already interrupted."""
     store = MemoryRunStore()
     manager = _make_manager(store=store)
     record = await manager.create("thread-1")
     await manager.set_status(record.run_id, RunStatus.interrupted)
 
     result = await manager.cancel(record.run_id)
-    assert result is True
+    assert result == CancelOutcome.cancelled
 
 
 # ---------------------------------------------------------------------------
@@ -965,3 +965,284 @@ async def test_list_inflight_with_expired_lease_null_lease_always_reclaimed():
     results = await store.list_inflight_with_expired_lease(grace_seconds=grace)
     result_ids = {r["run_id"] for r in results}
     assert "null-run" in result_ids
+
+
+# ---------------------------------------------------------------------------
+# claim_for_takeover — store primitive
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_claim_for_takeover_succeeds_with_expired_lease():
+    """claim_for_takeover must succeed when the lease has passed the grace window."""
+    store = MemoryRunStore()
+    grace = 10
+    expired_lease = (datetime.now(UTC) - timedelta(seconds=grace + 5)).isoformat()
+    await store.put("run-1", thread_id="t1", status="running", created_at=datetime.now(UTC).isoformat(), owner_worker_id="w-a", lease_expires_at=expired_lease)
+
+    ok = await store.claim_for_takeover("run-1", grace_seconds=grace, error="claimed")
+    assert ok is True
+
+    row = await store.get("run-1")
+    assert row is not None
+    assert row["status"] == "error"
+    assert row["error"] == "claimed"
+
+
+@pytest.mark.anyio
+async def test_claim_for_takeover_fails_with_valid_lease():
+    """claim_for_takeover must return False when the lease is still valid."""
+    store = MemoryRunStore()
+    grace = 10
+    valid_lease = (datetime.now(UTC) + timedelta(seconds=60)).isoformat()
+    await store.put("run-1", thread_id="t1", status="running", created_at=datetime.now(UTC).isoformat(), owner_worker_id="w-a", lease_expires_at=valid_lease)
+
+    ok = await store.claim_for_takeover("run-1", grace_seconds=grace, error="claimed")
+    assert ok is False
+
+    row = await store.get("run-1")
+    assert row is not None
+    assert row["status"] == "running"
+
+
+@pytest.mark.anyio
+async def test_claim_for_takeover_succeeds_with_null_lease():
+    """NULL-lease rows (pre-ownership data) must be claimable."""
+    store = MemoryRunStore()
+    await store.put("run-null", thread_id="t1", status="running", created_at=datetime.now(UTC).isoformat())
+
+    ok = await store.claim_for_takeover("run-null", grace_seconds=10, error="claimed")
+    assert ok is True
+
+    row = await store.get("run-null")
+    assert row["status"] == "error"
+
+
+@pytest.mark.anyio
+async def test_claim_for_takeover_fails_on_terminal_status():
+    """claim_for_takeover must return False for already-terminal runs."""
+    store = MemoryRunStore()
+    await store.put("run-done", thread_id="t1", status="success", created_at=datetime.now(UTC).isoformat())
+
+    ok = await store.claim_for_takeover("run-done", grace_seconds=10, error="claimed")
+    assert ok is False
+
+
+@pytest.mark.anyio
+async def test_claim_for_takeover_fails_for_nonexistent_run():
+    """claim_for_takeover must return False when the run doesn't exist."""
+    store = MemoryRunStore()
+    ok = await store.claim_for_takeover("no-such-run", grace_seconds=10, error="claimed")
+    assert ok is False
+
+
+# ---------------------------------------------------------------------------
+# cancel() cross-worker takeover — work item 4
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_cancel_takeover_from_crashed_worker():
+    """cancel must take over (mark error) when lease is expired and owner is another worker."""
+    store = MemoryRunStore()
+    grace = 10
+    expired_lease = (datetime.now(UTC) - timedelta(seconds=grace + 5)).isoformat()
+    await store.put("run-expired", thread_id="t1", status="running", created_at=datetime.now(UTC).isoformat(), owner_worker_id="dead-worker", lease_expires_at=expired_lease)
+
+    manager = _make_manager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True, grace_seconds=grace))
+    outcome = await manager.cancel("run-expired")
+    assert outcome == CancelOutcome.taken_over
+
+    row = await store.get("run-expired")
+    assert row is not None
+    assert row["status"] == "error"
+
+
+@pytest.mark.anyio
+async def test_cancel_refuses_active_lease_from_other_worker():
+    """cancel must return lease_valid_elsewhere when the run is owned by another worker with a valid lease."""
+    store = MemoryRunStore()
+    grace = 10
+    valid_lease = (datetime.now(UTC) + timedelta(seconds=60)).isoformat()
+    await store.put("run-alive", thread_id="t1", status="running", created_at=datetime.now(UTC).isoformat(), owner_worker_id="alive-worker", lease_expires_at=valid_lease)
+
+    manager = _make_manager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True, grace_seconds=grace))
+    outcome = await manager.cancel("run-alive")
+    assert outcome == CancelOutcome.lease_valid_elsewhere
+
+    row = await store.get("run-alive")
+    assert row is not None
+    assert row["status"] == "running"  # untouched
+
+
+@pytest.mark.anyio
+async def test_cancel_returns_unknown_when_no_store():
+    """cancel must return unknown when there's no store and the run is not in memory."""
+    manager = _make_manager(run_ownership_config=_lease_config(heartbeat_enabled=True))
+    outcome = await manager.cancel("no-such-run")
+    assert outcome == CancelOutcome.unknown
+
+
+@pytest.mark.anyio
+async def test_cancel_returns_not_active_locally_when_heartbeat_disabled():
+    """With heartbeat disabled, store-only runs must not be cancellable (old 409 path)."""
+    store = MemoryRunStore()
+    await store.put("store-only", thread_id="t1", status="running", created_at=datetime.now(UTC).isoformat())
+
+    manager = _make_manager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=False))
+    outcome = await manager.cancel("store-only")
+    assert outcome == CancelOutcome.not_active_locally
+
+
+@pytest.mark.anyio
+async def test_cancel_takeover_race_owner_renewed_lease():
+    """When the owner heartbeats between our read and the conditional UPDATE, cancel must return lease_valid_elsewhere."""
+    store = MemoryRunStore()
+    grace = 10
+    expired_lease = (datetime.now(UTC) - timedelta(seconds=grace + 5)).isoformat()
+    await store.put("run-race", thread_id="t1", status="running", created_at=datetime.now(UTC).isoformat(), owner_worker_id="w-a", lease_expires_at=expired_lease)
+
+    # Simulate the race: right before claim_for_takeover writes, another
+    # heartbeat renews the lease.  We monkey-patch claim_for_takeover to
+    # simulate the lease having been renewed.
+    original = store.claim_for_takeover
+
+    async def race_lost(run_id, *, grace_seconds, error):
+        # Simulate a heartbeat renewal between the read and the write
+        run = store._runs.get(run_id)
+        if run and run["status"] in ("pending", "running"):
+            run["lease_expires_at"] = (datetime.now(UTC) + timedelta(seconds=60)).isoformat()
+        return await original(run_id, grace_seconds=grace_seconds, error=error)
+
+    store.claim_for_takeover = race_lost
+    manager = _make_manager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True, grace_seconds=grace))
+
+    outcome = await manager.cancel("run-race")
+    assert outcome == CancelOutcome.lease_valid_elsewhere
+
+
+@pytest.mark.anyio
+async def test_cancel_takeover_respects_grace_seconds():
+    """Cancel must not take over when the lease is within the grace window."""
+    store = MemoryRunStore()
+    grace = 10
+    # Lease expired, but only by 3s — still within the 10s grace window
+    just_expired = (datetime.now(UTC) - timedelta(seconds=3)).isoformat()
+    await store.put("run-grace", thread_id="t1", status="running", created_at=datetime.now(UTC).isoformat(), owner_worker_id="w-a", lease_expires_at=just_expired)
+
+    manager = _make_manager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True, grace_seconds=grace))
+    outcome = await manager.cancel("run-grace")
+    assert outcome == CancelOutcome.lease_valid_elsewhere
+
+
+@pytest.mark.anyio
+async def test_cancel_not_cancellable_for_store_terminal_run():
+    """cancel must return not_cancellable when the store run is already in a terminal state."""
+    store = MemoryRunStore()
+    await store.put("run-done", thread_id="t1", status="success", created_at=datetime.now(UTC).isoformat())
+
+    manager = _make_manager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True))
+    outcome = await manager.cancel("run-done")
+    assert outcome == CancelOutcome.not_cancellable
+
+
+# ---------------------------------------------------------------------------
+# HTTP-level — cancel endpoint cross-worker responses
+# ---------------------------------------------------------------------------
+
+
+def _make_cancel_test_app(mgr: RunManager):
+    """Build a TestClient wired with the thread_runs router + memory bridge."""
+    from _router_auth_helpers import make_authed_test_app
+    from fastapi.testclient import TestClient
+
+    from app.gateway.routers import thread_runs
+    from deerflow.runtime import MemoryStreamBridge
+
+    app = make_authed_test_app()
+    app.include_router(thread_runs.router)
+    app.state.run_manager = mgr
+    app.state.stream_bridge = MemoryStreamBridge()
+    return TestClient(app, raise_server_exceptions=False)
+
+
+def test_http_cancel_non_owner_valid_lease_returns_409_with_retry_after():
+    """POST /cancel on a non-owning worker with a valid lease must return 409 + Retry-After."""
+    store = MemoryRunStore()
+    grace = 10
+    valid_lease = (datetime.now(UTC) + timedelta(seconds=60)).isoformat()
+    asyncio.run(
+        store.put(
+            "run-alive",
+            thread_id="t1",
+            status="running",
+            created_at=datetime.now(UTC).isoformat(),
+            owner_worker_id="alive-worker",
+            lease_expires_at=valid_lease,
+        )
+    )
+    mgr = _make_manager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True, grace_seconds=grace))
+    client = _make_cancel_test_app(mgr)
+
+    resp = client.post("/api/threads/t1/runs/run-alive/cancel")
+    assert resp.status_code == 409
+    assert "Retry-After" in resp.headers
+    # Retry-After = remaining lease (≈60s) + grace (10s) = ≈70s
+    retry_after = int(resp.headers["Retry-After"])
+    assert 50 <= retry_after <= 75
+
+    # Store row must be untouched
+    row = asyncio.run(store.get("run-alive"))
+    assert row["status"] == "running"
+
+
+def test_http_cancel_non_owner_expired_lease_returns_202_takeover():
+    """POST /cancel on a non-owning worker with an expired lease must return 202 (takeover)."""
+    store = MemoryRunStore()
+    grace = 10
+    expired_lease = (datetime.now(UTC) - timedelta(seconds=grace + 30)).isoformat()
+    asyncio.run(
+        store.put(
+            "run-dead",
+            thread_id="t1",
+            status="running",
+            created_at=datetime.now(UTC).isoformat(),
+            owner_worker_id="dead-worker",
+            lease_expires_at=expired_lease,
+        )
+    )
+    mgr = _make_manager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True, grace_seconds=grace))
+    client = _make_cancel_test_app(mgr)
+
+    resp = client.post("/api/threads/t1/runs/run-dead/cancel")
+    assert resp.status_code == 202
+
+    # Store row must be marked error
+    row = asyncio.run(store.get("run-dead"))
+    assert row["status"] == "error"
+
+
+def test_http_stream_action_interrupt_takeover_returns_202_not_hang():
+    """POST /stream?action=interrupt on a dead-owner run must return 202 immediately, not hang on SSE."""
+    store = MemoryRunStore()
+    grace = 10
+    expired_lease = (datetime.now(UTC) - timedelta(seconds=grace + 30)).isoformat()
+    asyncio.run(
+        store.put(
+            "run-dead-stream",
+            thread_id="t1",
+            status="running",
+            created_at=datetime.now(UTC).isoformat(),
+            owner_worker_id="dead-worker",
+            lease_expires_at=expired_lease,
+        )
+    )
+    mgr = _make_manager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True, grace_seconds=grace))
+    client = _make_cancel_test_app(mgr)
+
+    # This must NOT hang — the takeover path returns 202 before reaching StreamingResponse.
+    resp = client.post("/api/threads/t1/runs/run-dead-stream/stream", params={"action": "interrupt"})
+    assert resp.status_code == 202
+
+    row = asyncio.run(store.get("run-dead-stream"))
+    assert row["status"] == "error"

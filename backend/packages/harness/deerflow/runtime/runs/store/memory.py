@@ -194,6 +194,28 @@ class MemoryRunStore(RunStore):
         run["updated_at"] = datetime.now(UTC).isoformat()
         return True
 
+    async def claim_for_takeover(
+        self,
+        run_id: str,
+        *,
+        grace_seconds: int,
+        error: str,
+    ) -> bool:
+        from deerflow.runtime.runs.manager import _is_lease_expired
+
+        run = self._runs.get(run_id)
+        if run is None:
+            return False
+        if run["status"] not in ("pending", "running"):
+            return False
+        lease = run.get("lease_expires_at")
+        if not _is_lease_expired(lease, grace_seconds=grace_seconds):
+            return False
+        run["status"] = "error"
+        run["error"] = error
+        run["updated_at"] = datetime.now(UTC).isoformat()
+        return True
+
     async def list_inflight_with_expired_lease(
         self,
         *,
