@@ -1246,3 +1246,76 @@ def test_http_stream_action_interrupt_takeover_returns_202_not_hang():
 
     row = asyncio.run(store.get("run-dead-stream"))
     assert row["status"] == "error"
+
+
+# ---------------------------------------------------------------------------
+# Split-brain defences — update_status guard + heartbeat self-termination
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_update_status_rejects_terminal_row():
+    """update_status must return False when the store row is no longer pending/running.
+
+    If another worker took over and set the row to 'error', the original
+    owner's final status write must not overwrite it."""
+    store = MemoryRunStore()
+    await store.put("run-1", thread_id="t1", status="error", created_at=datetime.now(UTC).isoformat())
+    ok = await store.update_status("run-1", "success")
+    assert ok is False
+    row = await store.get("run-1")
+    assert row["status"] == "error"
+
+
+@pytest.mark.anyio
+async def test_persist_status_skips_recovery_when_row_taken_over():
+    """_persist_status must not recreate a row that was taken over by another worker.
+
+    When update_status returns False, the recovery path checks whether the
+    row still exists. A row that exists but is terminal (taken over) must
+    be left alone — calling put() would overwrite the takeover."""
+    store = MemoryRunStore()
+    mgr = RunManager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True))
+
+    # Simulate: this worker created and started a run, but a peer took it over.
+    record = await mgr.create("thread-1")
+    await mgr.set_status(record.run_id, RunStatus.running)
+    # Peer takeover: directly flip the store row to error
+    await store.update_status(record.run_id, "error")
+    # Now simulate the original owner's task finishing and trying to write success
+    ok = await mgr._persist_status(record, RunStatus.success)
+    assert ok is False  # skipped recovery, row already exists and is terminal
+    row = await store.get(record.run_id)
+    assert row["status"] == "error"  # not overwritten
+
+
+@pytest.mark.anyio
+async def test_heartbeat_cancels_task_on_lease_loss():
+    """Heartbeat must cancel the local asyncio task when update_lease returns False.
+
+    If the store row was claimed by another worker (status no longer
+    pending/running, or owner changed), the heartbeat tick must abort the
+    local task so wasted CPU is bounded to ~10s instead of the full task
+    lifetime."""
+    store = MemoryRunStore()
+    mgr = RunManager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True, lease_seconds=30))
+
+    # Create a run that this worker owns
+    record = await mgr.create("thread-1")
+    await mgr.set_status(record.run_id, RunStatus.running)
+
+    # Spawn a dummy task so cancel has something to stop
+    loop = asyncio.get_running_loop()
+    record.task = loop.create_task(asyncio.sleep(3600))
+
+    # Simulate takeover: directly flip the store row to error
+    await store.update_status(record.run_id, "error")
+
+    # Run a single heartbeat tick — it should see update_lease return False
+    # and cancel the task
+    await mgr._renew_leases()
+
+    # Let the event loop process the cancellation (task.cancel() schedules,
+    # doesn't await).
+    await asyncio.sleep(0)
+    assert record.task.cancelled()
