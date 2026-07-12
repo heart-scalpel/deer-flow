@@ -557,6 +557,13 @@ async def cancel_run(
     # The run is still alive on another worker — tell the client when
     # to retry (the lease will expire by then).
     if outcome == CancelOutcome.lease_valid_elsewhere:
+        # ``record.lease_expires_at`` was fetched at request start and may
+        # be stale — the owner may have renewed between our read and the
+        # conditional UPDATE in ``claim_for_takeover``. Re-fetch to get the
+        # fresh lease so ``Retry-After`` is accurate.
+        fresh = await run_mgr.get(run_id)
+        if fresh is not None:
+            record = fresh
         retry_after = _compute_retry_after(record.lease_expires_at, run_mgr.grace_seconds)
         headers: dict[str, str] = {}
         if retry_after is not None:
@@ -634,6 +641,9 @@ async def stream_existing_run(
             return Response(status_code=202)
         if outcome != CancelOutcome.cancelled:
             if outcome == CancelOutcome.lease_valid_elsewhere:
+                fresh = await run_mgr.get(run_id)
+                if fresh is not None:
+                    record = fresh
                 retry_after = _compute_retry_after(record.lease_expires_at, run_mgr.grace_seconds)
                 headers: dict[str, str] = {}
                 if retry_after is not None:

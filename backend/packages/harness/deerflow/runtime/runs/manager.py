@@ -360,6 +360,19 @@ class RunManager:
                 lambda: self._store.update_status(record.run_id, status.value, error=error),
             )
             if updated is False:
+                # ``update_status`` is now guarded by ``status IN ('pending','running')``.
+                # False can mean either:
+                #   (a) the row was never persisted (initial ``put()`` failed) → recreate.
+                #   (b) the row is terminal because another worker took it over → skip.
+                existing = await self._store.get(record.run_id)
+                if existing is not None:
+                    logger.warning(
+                        "Run %s status update to %s skipped: store row already at %s (likely takeover)",
+                        record.run_id,
+                        status.value,
+                        existing.get("status"),
+                    )
+                    return False
                 return await self._persist_snapshot_to_store(record.run_id, row_recovery_payload)
             return True
         except Exception:
@@ -766,7 +779,7 @@ class RunManager:
         if not _is_lease_expired(lease_expires_at, grace_seconds=grace_seconds):
             return CancelOutcome.lease_valid_elsewhere
 
-        take_over_msg = f"Run reclaimed by worker {self._worker_id}: the owning worker ({row.get('owner_worker_id')}) stopped renewing its lease and is presumed dead."
+        take_over_msg = f"Run reclaimed by worker {self._worker_id}: the owning worker ({row.get('owner_worker_id') or 'unknown'}) stopped renewing its lease and is presumed dead."
         try:
             taken = await self._call_store_with_retry(
                 "claim_for_takeover",
@@ -1065,8 +1078,13 @@ class RunManager:
 
     @property
     def grace_seconds(self) -> int:
-        """Return the configured grace seconds (or ``10`` when ownership is unconfigured)."""
-        return self._run_ownership_config.grace_seconds if self._run_ownership_config else 10
+        """Return the configured grace seconds.
+
+        Only called downstream of ``heartbeat_enabled``, which is False
+        whenever ``_run_ownership_config`` is None, so the attribute is
+        always present here.
+        """
+        return self._run_ownership_config.grace_seconds  # type: ignore[union-attr]
 
     async def start_heartbeat(self) -> None:
         """Start the background lease-renewal task.
@@ -1185,6 +1203,22 @@ class RunManager:
                     # fields). Re-acquiring ``self._lock`` here would
                     # serialise against unrelated run mutations for no gain.
                     record.lease_expires_at = new_expiry
+                else:
+                    # ``update_lease`` returned False — the row was claimed
+                    # by another worker (status is no longer pending/running,
+                    # or ``owner_worker_id`` changed). Stop the local task so
+                    # we don't waste CPU or overwrite the takeover status on
+                    # finalisation.
+                    logger.warning(
+                        "Run %s lease renewal failed (status=%s,owner=%s) – worker likely taken over; aborting local task",
+                        run_id,
+                        record.status.value,
+                        record.owner_worker_id,
+                    )
+                    record.abort_event.set()
+                    task_active = record.task is not None and not record.task.done()
+                    if task_active:
+                        record.task.cancel()
             except Exception:
                 logger.warning("Failed to renew lease for run %s", run_id, exc_info=True)
 
