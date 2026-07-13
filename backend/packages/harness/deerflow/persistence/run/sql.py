@@ -20,6 +20,11 @@ from deerflow.runtime.user_context import AUTO, _AutoSentinel, resolve_user_id
 from deerflow.utils.time import coerce_iso
 
 
+def _lease_expired_or_null(lease_col, cutoff: datetime):
+    """SQLAlchemy filter: True when the lease is NULL or has expired past *cutoff*."""
+    return or_(lease_col.is_(None), lease_col < cutoff)
+
+
 class RunRepository(RunStore):
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._sf = session_factory
@@ -165,8 +170,13 @@ class RunRepository(RunStore):
         values: dict[str, Any] = {"status": status, "updated_at": datetime.now(UTC)}
         if error is not None:
             values["error"] = error
+        # Guard: only transition rows that are still active. ``interrupted`` is
+        # included because the rollback path goes ``running → interrupted``
+        # (cancel acknowledged) then ``interrupted → error`` (task finalize).
+        # ``error`` and ``success`` remain locked so a peer's takeover (or a
+        # completed run) cannot be overwritten by a late writer.
         async with self._sf() as session:
-            result = await session.execute(update(RunRow).where(RunRow.run_id == run_id, RunRow.status.in_(("pending", "running"))).values(**values))
+            result = await session.execute(update(RunRow).where(RunRow.run_id == run_id, RunRow.status.in_(("pending", "running", "interrupted"))).values(**values))
             await session.commit()
             return result.rowcount != 0
 
@@ -418,10 +428,7 @@ class RunRepository(RunStore):
                 .where(
                     RunRow.run_id == run_id,
                     RunRow.status.in_(("pending", "running")),
-                    or_(
-                        RunRow.lease_expires_at.is_(None),
-                        RunRow.lease_expires_at < cutoff,
-                    ),
+                    _lease_expired_or_null(RunRow.lease_expires_at, cutoff),
                 )
                 .values(status="error", error=error, updated_at=datetime.now(UTC))
             )
@@ -446,10 +453,7 @@ class RunRepository(RunStore):
             .where(
                 RunRow.status.in_(("pending", "running")),
                 RunRow.created_at <= before_dt,
-                or_(
-                    RunRow.lease_expires_at.is_(None),
-                    RunRow.lease_expires_at < cutoff,
-                ),
+                _lease_expired_or_null(RunRow.lease_expires_at, cutoff),
             )
             .order_by(RunRow.created_at.asc())
         )

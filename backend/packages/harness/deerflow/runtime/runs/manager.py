@@ -821,10 +821,25 @@ class RunManager:
             logger.warning("Run %s taken over by worker %s (action=%s)", run_id, self._worker_id, action)
             return CancelOutcome.taken_over
 
-        # The conditional UPDATE matched 0 rows — the owner renewed the
-        # lease between our read and write, or another worker already
-        # claimed it. Surface as lease-valid-elsewhere so the client can
-        # retry, same as the still-alive branch above.
+        # The conditional UPDATE matched 0 rows. Two causes:
+        #   (a) the owner renewed the lease → lease_valid_elsewhere.
+        #   (b) the row went terminal between our read and the claim
+        #       (run finished, or another worker already took it over)
+        #       → not_cancellable or taken_over.
+        # Re-read to distinguish.
+        try:
+            fresh = await self._store.get(run_id)
+        except Exception:
+            fresh = None
+        if fresh is None:
+            return CancelOutcome.unknown
+        fresh_status = fresh.get("status")
+        if fresh_status not in ("pending", "running"):
+            if fresh_status == "error":
+                logger.info("Run %s takeover lost to another worker already at error", run_id)
+                return CancelOutcome.taken_over
+            return CancelOutcome.not_cancellable
+        # Row is still active — lease must have been renewed by the owner.
         return CancelOutcome.lease_valid_elsewhere
 
     def _compute_lease_expires_at(self) -> str | None:

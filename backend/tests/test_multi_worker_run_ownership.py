@@ -1255,16 +1255,27 @@ def test_http_stream_action_interrupt_takeover_returns_202_not_hang():
 
 @pytest.mark.anyio
 async def test_update_status_rejects_terminal_row():
-    """update_status must return False when the store row is no longer pending/running.
-
-    If another worker took over and set the row to 'error', the original
-    owner's final status write must not overwrite it."""
+    """update_status must return False when the store row is already terminal
+    (error/success), so a late writer cannot overwrite a peer's takeover or
+    a completed run. interrupted is NOT terminal — the rollback path needs
+    ``interrupted → error`` to finalize."""
     store = MemoryRunStore()
-    await store.put("run-1", thread_id="t1", status="error", created_at=datetime.now(UTC).isoformat())
-    ok = await store.update_status("run-1", "success")
-    assert ok is False
-    row = await store.get("run-1")
+    # error (takeover) must stay locked
+    await store.put("run-err", thread_id="t1", status="error", created_at=datetime.now(UTC).isoformat())
+    assert await store.update_status("run-err", "success") is False
+    assert (await store.get("run-err"))["status"] == "error"
+
+    # success must stay locked
+    await store.put("run-ok", thread_id="t1", status="success", created_at=datetime.now(UTC).isoformat())
+    assert await store.update_status("run-ok", "error") is False
+    assert (await store.get("run-ok"))["status"] == "success"
+
+    # interrupted → error MUST pass (rollback finalize path)
+    await store.put("run-rb", thread_id="t1", status="interrupted", created_at=datetime.now(UTC).isoformat())
+    assert await store.update_status("run-rb", "error", error="Rolled back by user") is True
+    row = await store.get("run-rb")
     assert row["status"] == "error"
+    assert row["error"] == "Rolled back by user"
 
 
 @pytest.mark.anyio
@@ -1356,3 +1367,163 @@ async def test_cancel_returns_taken_over_when_peer_claims_during_local_cancel():
     # Store row must reflect the takeover, not the local cancel
     row = await store.get(record.run_id)
     assert row["status"] == "error"
+
+
+@pytest.mark.anyio
+async def test_cancel_action_rollback_finalizes_to_error_in_store():
+    """action=rollback must end up as error in the store with the
+    "Rolled back by user" message preserved.
+
+    Regression guard: the update_status guard was originally
+    ``status IN ('pending','running')`` which blocked the rollback path's
+    ``interrupted → error`` transition — the store stayed interrupted and
+    the rollback message was lost.
+    """
+    store = MemoryRunStore()
+    mgr = RunManager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True))
+
+    record = await mgr.create("thread-1")
+    await mgr.set_status(record.run_id, RunStatus.running)
+
+    # Step 1: cancel(action=rollback) flips running → interrupted
+    outcome = await mgr.cancel(record.run_id, action="rollback")
+    assert outcome == CancelOutcome.cancelled
+    row = await store.get(record.run_id)
+    assert row["status"] == "interrupted"
+
+    # Step 2: worker.py finalize path — task raises CancelledError, then
+    # set_status(error, "Rolled back by user"). The widened guard
+    # (interrupted is in the whitelist) must let this through.
+    await mgr.set_status(record.run_id, RunStatus.error, error="Rolled back by user")
+    row = await store.get(record.run_id)
+    assert row["status"] == "error"
+    assert row["error"] == "Rolled back by user"
+
+
+# ---------------------------------------------------------------------------
+# cancel() claim_for_takeover False → re-read precision
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_cancel_claim_lost_to_terminal_returns_not_cancellable():
+    """When cancel() reads the run as active but claim_for_takeover returns
+    False because the row went terminal (run finished) between the read and
+    the conditional UPDATE, the re-read must surface not_cancellable."""
+    store = MemoryRunStore()
+    mgr = _make_manager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True, grace_seconds=10))
+
+    # Seed as running so cancel()'s first read passes the status guard.
+    expired = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()
+    await store.put(
+        "run-race",
+        thread_id="t1",
+        status="running",
+        owner_worker_id="w-a",
+        lease_expires_at=expired,
+        created_at=datetime.now(UTC).isoformat(),
+    )
+
+    # Wrap claim_for_takeover: flip the row to success just before the
+    # conditional UPDATE so it matches 0 rows.
+    original = store.claim_for_takeover
+
+    async def race_claim(run_id, *, grace_seconds, error):
+        store._runs[run_id]["status"] = "success"
+        return await original(run_id, grace_seconds=grace_seconds, error=error)
+
+    store.claim_for_takeover = race_claim
+
+    outcome = await mgr.cancel("run-race")
+    assert outcome == CancelOutcome.not_cancellable
+
+
+@pytest.mark.anyio
+async def test_cancel_claim_lost_to_takeover_returns_taken_over():
+    """When cancel() reads the run as active but claim_for_takeover returns
+    False because another worker already took it over (row is error), the
+    re-read must surface taken_over."""
+    store = MemoryRunStore()
+    mgr = _make_manager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True, grace_seconds=10))
+
+    expired = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()
+    await store.put(
+        "run-race",
+        thread_id="t1",
+        status="running",
+        owner_worker_id="w-a",
+        lease_expires_at=expired,
+        created_at=datetime.now(UTC).isoformat(),
+    )
+
+    # Wrap claim_for_takeover: flip the row to error before the conditional
+    # UPDATE so it matches 0 rows (peer already took it over).
+    original = store.claim_for_takeover
+
+    async def race_takeover(run_id, *, grace_seconds, error):
+        store._runs[run_id]["status"] = "error"
+        store._runs[run_id]["error"] = "peer claim"
+        return await original(run_id, grace_seconds=grace_seconds, error=error)
+
+    store.claim_for_takeover = race_takeover
+
+    outcome = await mgr.cancel("run-race")
+    assert outcome == CancelOutcome.taken_over
+
+
+# ---------------------------------------------------------------------------
+# _compute_retry_after unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_compute_retry_after_null_lease_returns_none():
+    from app.gateway.routers.thread_runs import _compute_retry_after
+
+    assert _compute_retry_after(None, 10) is None
+
+
+def test_compute_retry_after_unparseable_returns_none():
+    from app.gateway.routers.thread_runs import _compute_retry_after
+
+    assert _compute_retry_after("not-a-date", 10) is None
+
+
+def test_compute_retry_after_normal():
+    from app.gateway.routers.thread_runs import _compute_retry_after
+
+    future = (datetime.now(UTC) + timedelta(seconds=45)).isoformat()
+    val = _compute_retry_after(future, 10)
+    assert val is not None
+    # lease_expires_at is ~45s from now + grace_seconds 10 = ~55, within reason
+    assert 40 <= val <= 65
+
+
+# ---------------------------------------------------------------------------
+# HTTP — stream endpoint cross-worker 409
+# ---------------------------------------------------------------------------
+
+
+def test_http_stream_action_interrupt_non_owner_returns_409_with_retry_after():
+    """POST /stream?action=interrupt on a non-owner with valid lease must
+    return 409 + Retry-After, not hang on SSE."""
+    store = MemoryRunStore()
+    grace = 10
+    valid_lease = (datetime.now(UTC) + timedelta(seconds=60)).isoformat()
+    asyncio.run(
+        store.put(
+            "run-alive-stream",
+            thread_id="t1",
+            status="running",
+            owner_worker_id="alive-worker",
+            lease_expires_at=valid_lease,
+            created_at=datetime.now(UTC).isoformat(),
+        )
+    )
+    mgr = _make_manager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True, grace_seconds=grace))
+    client = _make_cancel_test_app(mgr)
+
+    resp = client.post("/api/threads/t1/runs/run-alive-stream/stream", params={"action": "interrupt"})
+    assert resp.status_code == 409
+    assert "Retry-After" in resp.headers
+    retry_after = int(resp.headers["Retry-After"])
+    assert 50 <= retry_after <= 75

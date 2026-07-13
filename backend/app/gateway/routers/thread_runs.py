@@ -164,6 +164,31 @@ def _compute_retry_after(lease_expires_at: str | None, grace_seconds: int) -> in
     return max(1, int(remaining))
 
 
+async def _raise_lease_valid_elsewhere(
+    run_id: str,
+    run_mgr,  # RunManager (avoid import for testability)
+    record: RunRecord,
+) -> None:
+    """Re-fetch the lease and raise HTTP 409 + Retry-After.
+
+    ``record.lease_expires_at`` may be stale (fetched at request start while
+    the owner renewed between our read and the conditional UPDATE). Re-read
+    from the store to get the fresh value so ``Retry-After`` is accurate.
+    """
+    fresh = await run_mgr.get(run_id)
+    if fresh is not None:
+        record = fresh
+    retry_after = _compute_retry_after(record.lease_expires_at, run_mgr.grace_seconds)
+    headers: dict[str, str] = {}
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
+    raise HTTPException(
+        status_code=409,
+        detail=f"Run {run_id} is active on another worker; retry after lease expiry.",
+        headers=headers,
+    )
+
+
 def _record_to_response(record: RunRecord) -> RunResponse:
     return RunResponse(
         run_id=record.run_id,
@@ -554,25 +579,8 @@ async def cancel_run(
             return Response(status_code=204)
         return Response(status_code=202)
 
-    # The run is still alive on another worker — tell the client when
-    # to retry (the lease will expire by then).
     if outcome == CancelOutcome.lease_valid_elsewhere:
-        # ``record.lease_expires_at`` was fetched at request start and may
-        # be stale — the owner may have renewed between our read and the
-        # conditional UPDATE in ``claim_for_takeover``. Re-fetch to get the
-        # fresh lease so ``Retry-After`` is accurate.
-        fresh = await run_mgr.get(run_id)
-        if fresh is not None:
-            record = fresh
-        retry_after = _compute_retry_after(record.lease_expires_at, run_mgr.grace_seconds)
-        headers: dict[str, str] = {}
-        if retry_after is not None:
-            headers["Retry-After"] = str(retry_after)
-        raise HTTPException(
-            status_code=409,
-            detail=f"Run {run_id} is active on another worker; retry after lease expiry.",
-            headers=headers,
-        )
+        await _raise_lease_valid_elsewhere(run_id, run_mgr, record)
 
     # not_cancellable, not_active_locally, unknown
     raise HTTPException(status_code=409, detail=_cancel_conflict_detail(run_id, record))
@@ -641,18 +649,7 @@ async def stream_existing_run(
             return Response(status_code=202)
         if outcome != CancelOutcome.cancelled:
             if outcome == CancelOutcome.lease_valid_elsewhere:
-                fresh = await run_mgr.get(run_id)
-                if fresh is not None:
-                    record = fresh
-                retry_after = _compute_retry_after(record.lease_expires_at, run_mgr.grace_seconds)
-                headers: dict[str, str] = {}
-                if retry_after is not None:
-                    headers["Retry-After"] = str(retry_after)
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Run {run_id} is active on another worker; retry after lease expiry.",
-                    headers=headers,
-                )
+                await _raise_lease_valid_elsewhere(run_id, run_mgr, record)
             raise HTTPException(status_code=409, detail=_cancel_conflict_detail(run_id, record))
         if wait and record.task is not None:
             try:

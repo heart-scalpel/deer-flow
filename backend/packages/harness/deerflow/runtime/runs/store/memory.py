@@ -91,7 +91,9 @@ class MemoryRunStore(RunStore):
         run = self._runs.get(run_id)
         if run is None:
             return False
-        if run["status"] not in ("pending", "running"):
+        # Guard: only transition rows that are still active. ``interrupted``
+        # is included for the rollback path (``interrupted → error`` finalize).
+        if run["status"] not in ("pending", "running", "interrupted"):
             return False
         run["status"] = status
         if error is not None:
