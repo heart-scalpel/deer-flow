@@ -363,15 +363,25 @@ class RunManager:
                 # ``update_status`` is now guarded by ``status IN ('pending','running')``.
                 # False can mean either:
                 #   (a) the row was never persisted (initial ``put()`` failed) → recreate.
-                #   (b) the row is terminal because another worker took it over → skip.
+                #   (b) the row is terminal — either a peer takeover (``error``)
+                #       or a local cancel/completion race (``interrupted`` /
+                #       ``success``). The log severity branches on which.
                 existing = await self._store.get(record.run_id)
                 if existing is not None:
-                    logger.warning(
-                        "Run %s status update to %s skipped: store row already at %s (likely takeover)",
-                        record.run_id,
-                        status.value,
-                        existing.get("status"),
-                    )
+                    existing_status = existing.get("status")
+                    if existing_status == "error":
+                        logger.warning(
+                            "Run %s status update to %s skipped: store row already at error (peer takeover)",
+                            record.run_id,
+                            status.value,
+                        )
+                    else:
+                        logger.info(
+                            "Run %s status update to %s skipped: store row already at %s (local cancel/completion race)",
+                            record.run_id,
+                            status.value,
+                            existing_status,
+                        )
                     return False
                 return await self._persist_snapshot_to_store(record.run_id, row_recovery_payload)
             return True
@@ -746,7 +756,20 @@ class RunManager:
 
         # Persist outside the lock so store calls don't block other mutations.
         if record is not None:
-            await self._persist_status(record, RunStatus.interrupted)
+            persisted = await self._persist_status(record, RunStatus.interrupted)
+            if not persisted and self._store is not None:
+                # ``_persist_status`` already fetched ``existing`` internally;
+                # re-check the store to see if a peer takeover flipped the
+                # row to ``error`` between our in-memory cancel and the
+                # guarded ``update_status``. If so, surface ``taken_over``
+                # so the client sees a status consistent with the store.
+                try:
+                    existing = await self._store.get(run_id)
+                except Exception:
+                    existing = None
+                if existing is not None and existing.get("status") == "error":
+                    logger.info("Run %s local cancel superseded by peer takeover", run_id)
+                    return CancelOutcome.taken_over
             logger.info("Run %s cancelled (action=%s)", run_id, action)
             return CancelOutcome.cancelled
 

@@ -1319,3 +1319,40 @@ async def test_heartbeat_cancels_task_on_lease_loss():
     # doesn't await).
     await asyncio.sleep(0)
     assert record.task.cancelled()
+
+
+@pytest.mark.anyio
+async def test_cancel_returns_taken_over_when_peer_claims_during_local_cancel():
+    """When a peer's claim_for_takeover flips the row to error between this
+    worker's in-memory cancel and the guarded update_status, cancel() must
+    surface taken_over (not cancelled) so the client sees a status consistent
+    with the store."""
+    store = MemoryRunStore()
+    mgr = RunManager(store=store, run_ownership_config=_lease_config(heartbeat_enabled=True))
+
+    record = await mgr.create("thread-1")
+    await mgr.set_status(record.run_id, RunStatus.running)
+
+    # Wrap update_status so that the first call (from cancel's _persist_status)
+    # is rejected as if a peer already marked the row error. This simulates
+    # the race: in-memory cancel succeeds, but store write is blocked.
+    original = store.update_status
+
+    async def race_update(run_id, status, *, error=None):
+        # Simulate peer takeover: flip to error before our write lands
+        run = store._runs.get(run_id)
+        if run and run["status"] == "running" and status == "interrupted":
+            run["status"] = "error"
+            run["error"] = "peer takeover"
+            run["updated_at"] = datetime.now(UTC).isoformat()
+            return False  # our write was blocked
+        return await original(run_id, status, error=error)
+
+    store.update_status = race_update
+
+    outcome = await mgr.cancel(record.run_id)
+    assert outcome == CancelOutcome.taken_over
+
+    # Store row must reflect the takeover, not the local cancel
+    row = await store.get(record.run_id)
+    assert row["status"] == "error"
