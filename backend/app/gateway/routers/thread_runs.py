@@ -151,6 +151,11 @@ def _compute_retry_after(lease_expires_at: str | None, grace_seconds: int) -> in
 
     Returns ``None`` when the lease is NULL or unparseable so the caller
     can decide whether to send a generic 409 without the header.
+
+    The ``max(1, ...)`` floor means a lease just about to expire yields
+    ``Retry-After: 1``.  This is a lower bound, not a recommended poll
+    interval — clients that honour this header should apply minimum
+    backoff / jitter rather than retrying every second.
     """
     if lease_expires_at is None:
         return None

@@ -206,7 +206,7 @@ class MemoryRunStore(RunStore):
         grace_seconds: int,
         error: str,
     ) -> bool:
-        from deerflow.runtime.runs.manager import _is_lease_expired
+        from deerflow.utils.time import is_lease_expired
 
         run = self._runs.get(run_id)
         if run is None:
@@ -214,7 +214,7 @@ class MemoryRunStore(RunStore):
         if run["status"] not in ("pending", "running"):
             return False
         lease = run.get("lease_expires_at")
-        if not _is_lease_expired(lease, grace_seconds=grace_seconds):
+        if not is_lease_expired(lease, grace_seconds=grace_seconds):
             return False
         run["status"] = "error"
         run["error"] = error

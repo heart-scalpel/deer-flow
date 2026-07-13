@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.exc import IntegrityError as SAIntegrityError
 
+from deerflow.utils.time import is_lease_expired
 from deerflow.utils.time import now_iso as _now_iso
 
 from .schemas import DisconnectMode, RunStatus
@@ -131,25 +132,6 @@ def _is_retryable_persistence_error(exc: BaseException) -> bool:
             if isinstance(chained, BaseException):
                 pending.append(chained)
     return False
-
-
-def _is_lease_expired(lease_expires_at: str | None, *, grace_seconds: int) -> bool:
-    """Return ``True`` when *lease_expires_at* has elapsed past grace.
-
-    A NULL lease (pre-ownership data) is always considered expired so
-    take-over (cancel from a non-owning worker) can reclaim it in the
-    same way reconciliation does.  Unparseable timestamps are also
-    treated as expired (defence in depth).
-    """
-    if lease_expires_at is None:
-        return True
-    try:
-        dt = datetime.fromisoformat(lease_expires_at)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=UTC)
-    except (ValueError, TypeError):
-        return True
-    return dt < datetime.now(UTC) - timedelta(seconds=grace_seconds)
 
 
 @dataclass(frozen=True)
@@ -768,6 +750,12 @@ class RunManager:
                 except Exception:
                     existing = None
                 if existing is not None and existing.get("status") == "error":
+                    # The in-memory ``record.status`` is still ``interrupted``
+                    # (set under the lock above) while the store row is now
+                    # ``error``.  This transient staleness is harmless: the
+                    # ``_persist_status`` guard prevents the late finalisation
+                    # write from overwriting the takeover, and the store is the
+                    # authoritative source for subsequent reads.
                     logger.info("Run %s local cancel superseded by peer takeover", run_id)
                     return CancelOutcome.taken_over
             logger.info("Run %s cancelled (action=%s)", run_id, action)
@@ -799,7 +787,7 @@ class RunManager:
         grace_seconds = self.grace_seconds
         lease_expires_at: str | None = row.get("lease_expires_at")
 
-        if not _is_lease_expired(lease_expires_at, grace_seconds=grace_seconds):
+        if not is_lease_expired(lease_expires_at, grace_seconds=grace_seconds):
             return CancelOutcome.lease_valid_elsewhere
 
         take_over_msg = f"Run reclaimed by worker {self._worker_id}: the owning worker ({row.get('owner_worker_id') or 'unknown'}) stopped renewing its lease and is presumed dead."
@@ -1118,11 +1106,12 @@ class RunManager:
     def grace_seconds(self) -> int:
         """Return the configured grace seconds.
 
-        Only called downstream of ``heartbeat_enabled``, which is False
-        whenever ``_run_ownership_config`` is None, so the attribute is
-        always present here.
+        All current callers are downstream of ``heartbeat_enabled``, which
+        is False whenever ``_run_ownership_config`` is None.  The fallback
+        matches the Pydantic model default and is defensive against future
+        callers that might reach this property without that guard.
         """
-        return self._run_ownership_config.grace_seconds  # type: ignore[union-attr]
+        return self._run_ownership_config.grace_seconds if self._run_ownership_config else 10
 
     async def start_heartbeat(self) -> None:
         """Start the background lease-renewal task.
